@@ -1,7 +1,7 @@
 const std = @import("std");
 const fs = std.fs;
 const print = std.debug.print;
-const net = std.net; 
+const net = std.net;
 const expect = std.testing.expect;
 
 var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -10,10 +10,18 @@ const allocator = gpa.allocator();
 const Range = struct {
     hi : u32,
     lo : u32,
-    size : u32,
+    size : u32 = std.math.maxInt(u32),
 
-    bool isLarge(self: Range) bool {
-        return as(f32, (hi - lo + 1)) / size > 0.05;
+    fn isLarge(self: Range) bool {
+        return @as(f32, (self.hi - self.lo + 1)) / self.size > 0.05;
+    }
+
+    fn eq(self: Range, other: Range) bool {
+        return self.hi == other.hi and self.lo == other.lo;
+    }
+
+    fn lessThan(self: Range, other:Range) bool {
+        return self.lo < other.lo;
     }
 };
 
@@ -44,12 +52,12 @@ fn prefixToRange(p: Prefix) !Range {
 }
 
 fn parseIPv4Prefix(v: []const u8) !Range {
-    const p = std.mem.indexOf(u8, v, "/");   
-    if (p) |pos| { 
+    const p = std.mem.indexOf(u8, v, "/");
+    if (p) |pos| {
         const addr = try net.Ip4Address.parse(v[0 .. pos], 0);
         const plen = try std.fmt.parseInt(u6, v[pos + 1 .. v.len], 10);
         return prefixToRange(Prefix{ .prefix = addr.sa.addr, .len = plen });
-    } else { 
+    } else {
         return error.NotIPv4Prefix;
     }
 }
@@ -66,7 +74,7 @@ test {
     const r3 = try parseIPv4Prefix("0.0.0.0/0");
     try expect(r3.lo == 0x00000000);
     try expect(r3.hi == 0xffffffff);
-    
+
     const r4 = parseIPv4Prefix("1.2.3.0/36") catch null;
     try expect(r4 == null);
 }
@@ -127,15 +135,15 @@ fn truncateRange(comptime T: type, r: Range) RangeType(T) {
         u8 => return RangeType(u8) {
             .lo = (r.lo & 0xFF000000) >> 24,
             .hi = (r.hi & 0xFF000000) >> 24,
-        }, 
+        },
 
         else => unreachable,
     }
 }
 
 fn parseRule(line: []const u8, pri: u32) !Rule {
-    var it = std.mem.split(u8, line[1 .. line.len], "\t");  
-    const rule = Rule { .ranges = [_]Range { 
+    var it = std.mem.split(u8, line[1 .. line.len], "\t");
+    const rule = Rule { .ranges = [_]Range {
         try parseIPv4Prefix(it.next().?),
         try parseIPv4Prefix(it.next().?),
         try parsePortRange(it.next().?),
@@ -147,17 +155,17 @@ fn parseRule(line: []const u8, pri: u32) !Rule {
 
 const ParaCuts = union(enum) {
     u8x16: struct {
-        cuts: @Vector(u8, 16), 
+        cuts: @Vector(16, u8),
         shift: [17]u8,
     },
 
     u16x8: struct {
-        cuts: @Vector(u16, 8),
+        cuts: @Vector(8, u16),
         shift: [9]u8,
     },
 
     u32x4: struct {
-        cuts: @Vector(u32, 4),
+        cuts: @Vector(4, u32),
         shift: [5]u8,
     },
 };
@@ -173,7 +181,54 @@ const ParaNode = struct {
 const Seg = struct {
     range : Range,
     weight: usize = 1,
+
+    fn eq(self: Seg, other: Seg) bool {
+        return self.range.eq(other.range);
+    }
+
+    fn lessThan(self: Seg, other: Seg) bool {
+        return self.range.lessThan(other.range);
+    }
 };
+
+fn getUniq(comptime T: type) type {
+    return struct {
+        fn cmp(_: void, a: T, b: T) bool {
+            return a.lessThan(b);
+        }
+
+        fn uniq(list : *std.ArrayList(T)) void {
+            std.sort.block(T, list.items, {}, cmp);
+            var idx:usize = 1;
+            var u:usize = 0;
+
+            while (idx < list.items.len) : (idx += 1) {
+                if (!list.items[idx].eq(list.items[u])) {
+                    u += 1;
+                    if (u != idx) {
+                        list.items[u] = list.items[idx];
+                    }
+                } else {
+                    list.items[u].weight += 1;
+                }
+            }
+            list.shrinkAndFree(u + 1);
+        }
+    };
+}
+
+test {
+    var list = std.ArrayList(Seg).init(allocator);
+    defer list.deinit();
+    try list.append(Seg{ .range = .{ .lo = 1, .hi = 2} });
+    try list.append(Seg{ .range = .{ .lo = 0, .hi = 1} });
+    try list.append(Seg{ .range = .{ .lo = 2, .hi = 3} });
+    try list.append(Seg{ .range = .{ .lo = 0, .hi = 1} });
+    getUniq(Seg).uniq(&list);
+    try expect(list.items.len == 3);
+    try expect(list.items[0].eq(Seg{ .range = .{ .lo = 0, .hi = 1}}));
+    try expect(list.items[0].weight == 2);
+}
 
 const ParaTree = struct {
     root: ParaNode,
@@ -182,55 +237,41 @@ const ParaTree = struct {
 
     }
 
-    fn segCmp(_ : anytype, a: Seg, b: Seg) bool {
-        return a.lo < b.lo;
-    }
 
-    fn uniqSegs(seg_list : *std.ArrayList(Seg)) void {
-        std.sort.block(Seg, seg_list.items, {}, segCmp);
-        var idx:usize = 0;
-        var uniq:usize = 0;
-
-        while (idx < seg_list.items.len) : (idx += 1) {
-            seg_list.items[
-
-        }
-    }
-
-    fn chooseDimension(self: *ParaTree, dim_ranges: *[dim]std.ArrayList(Seg)) u8 {
+    fn chooseDimension(self: *ParaTree, dim_ranges: *[Dim]std.ArrayList(Seg)) u8 {
         var i:usize = 0;
-        while (i < dim) : (i += 1) {
+        while (i < Dim) : (i += 1) {
             dim_ranges[i] = std.ArrayList(*Range).init(allocator);
             for (self.root.rules) |r| {
                 dim_ranges[i].append(Seg{ .range = r.ranges[i] });
             }
-            uniqSegs(&dim_ranges[i]);
+            getUniq(Seg).uniq(&dim_ranges[i]);
         }
+        return 0;
     }
 
-    fn build(self: *ParaTree) void {
-        var dim_ranges : [dim]std.ArrayList(Seg) = undefined;
-        defer {
-            var i = 0;
-            while (i < dim) : (i += 1) {
-                dim_ranges[i].deinit();
-            }
-        };
+    //fn build(self: *ParaTree) void {
+    //    var dim_ranges : [Dim]std.ArrayList(Seg) = undefined;
+    //    defer {
+    //        var i = 0;
+    //        while (i < Dim) : (i += 1) {
+    //            dim_ranges[i].deinit();
+    //        }
+    //    }
 
-        const dim = chooseDimension(self, &dim_ranges)
-
-    }
+    //    const dim = chooseDimension(self, &dim_ranges);
+    //}
 };
 
-fn paraCut(rule_list : *std.ArrayList(Rule)) ParaTree {
+fn paraCut(rule_list : *std.ArrayList(Rule)) !ParaTree {
     var tree: ParaTree = undefined;
     tree.root.rules = std.ArrayList(*Rule).init(allocator);
-    
+
     for (rule_list.items) |*r| {
-        tree.root.rules.append(r);
+        try tree.root.rules.append(r);
     }
 
-    tree.build();
+    //tree.build();
     return tree;
 }
 
@@ -242,7 +283,7 @@ pub fn main() !void {
 
     const rdr = file.reader();
     var line_no:u32 = 0;
-    var rule_list = std.ArrayList(Rule).init(allocator); 
+    var rule_list = std.ArrayList(Rule).init(allocator);
     defer rule_list.deinit();
 
     while (try rdr.readUntilDelimiterOrEofAlloc(allocator, '\n', 4096)) |line| {
@@ -251,10 +292,10 @@ pub fn main() !void {
             continue;
         }
         const rule = try parseRule(line, line_no);
-        rule_list.append(rule);
+        try rule_list.append(rule);
         line_no += 1;
     }
 
-    paraCut(&rule_list);
+    _  = try paraCut(&rule_list);
 }
 
