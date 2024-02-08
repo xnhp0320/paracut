@@ -4,18 +4,20 @@ const print = std.debug.print;
 const net = std.net;
 const expect = std.testing.expect;
 
-var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+var gpa = std.heap.GeneralPurposeAllocator(.{.safety = false}){};
 const allocator = gpa.allocator();
 
 const Range = struct {
-    hi : u32,
     lo : u32,
+    hi : u32,
 
     fn eq(self: Range, other: Range) bool {
         return self.hi == other.hi and self.lo == other.lo;
     }
 
     fn lessThan(self: Range, other:Range) bool {
+        if (self.lo == other.lo)
+            return self.hi < other.hi;
         return self.lo < other.lo;
     }
 };
@@ -216,6 +218,9 @@ fn getUniq(comptime T: type) type {
         }
 
         fn uniq(list : *std.ArrayList(T), weighted: bool) void {
+            if (list.items.len == 0)
+                return;
+
             std.sort.block(T, list.items, {}, cmp);
             var idx:usize = 1;
             var u:usize = 0;
@@ -268,9 +273,10 @@ const ParaTree = struct {
 
     const PQlt = std.PriorityQueue(u32, void, lessThan);
 
-    fn genNonOverlappedSegs(seg_list: *std.ArrayList(Seg)) !std.ArrayList(Seg) {
+    fn genNonOverlappedSegs(seg_list: *const std.ArrayList(Seg)) !std.ArrayList(Seg) {
         var list = std.ArrayList(Seg).init(allocator);
         var h = PQlt.init(allocator, {});
+        defer h.deinit();
         const items = seg_list.items;
 
 
@@ -315,7 +321,7 @@ const ParaTree = struct {
                     } else if (r.lo > top) {
                         // r.lo > top, and since there are values in heap, there are overlapped
                         // ranges.
-                        if (curr < top) {
+                        if (curr <= top) {
                             try list.append(Seg{.range = .{ .lo = curr, .hi = top} });
                             curr = top + 1;
                         }
@@ -350,17 +356,6 @@ const ParaTree = struct {
         try l.append(Seg{ .range = .{ .lo = 0, .hi = 0}});
         try l.append(Seg{ .range = .{ .lo = 0, .hi = 1}});
         var g = try genNonOverlappedSegs(&l);
-        try expect(g.items[0].eq(Seg{ .range = .{ .lo = 0, .hi = 0 }}));
-        try expect(g.items[1].eq(Seg{ .range = .{ .lo = 1, .hi = 1 }}));
-        try expect(g.items.len == 2);
-        g.deinit();
-        l.clearAndFree();
-
-
-        // [0, 1] and [0, 0]
-        try l.append(Seg{ .range = .{ .lo = 0, .hi = 1}});
-        try l.append(Seg{ .range = .{ .lo = 0, .hi = 0}});
-        g = try genNonOverlappedSegs(&l);
         try expect(g.items[0].eq(Seg{ .range = .{ .lo = 0, .hi = 0 }}));
         try expect(g.items[1].eq(Seg{ .range = .{ .lo = 1, .hi = 1 }}));
         try expect(g.items.len == 2);
@@ -438,22 +433,40 @@ const ParaTree = struct {
         try expect(g.items.len == 2);
         g.deinit();
         l.clearAndFree();
+
+        // [0, 0], [2, 2]
+        try l.append(Seg{ .range = .{ .lo = 0, .hi = 0}});
+        try l.append(Seg{ .range = .{ .lo = 2, .hi = 2}});
+        g = try genNonOverlappedSegs(&l);
+        try expect(g.items[0].eq(Seg{ .range = .{ .lo = 0, .hi = 0 }}));
+        try expect(g.items[1].eq(Seg{ .range = .{ .lo = 2, .hi = 2 }}));
+        try expect(g.items.len == 2);
+        g.deinit();
+        l.clearAndFree();
+
     }
 
-    const CutEff = struct {
-        cut: CutTag,
-        eff: f32,
-    };
+    fn dumpSegs(segs: *const std.ArrayList(Seg)) void {
+        for (segs.items) |s| {
+            print("{}\n", .{s});
+        }
+    }
 
     fn genWeightedSeg(segs: *std.ArrayList(Seg)) !std.ArrayList(Seg) {
         getUniq(Seg).uniq(segs, true);
+        //print("origin segs:\n", .{});
+        //dumpSegs(segs);
         const non_overlapped = try genNonOverlappedSegs(segs);
         for (segs.items) |*seg| {
+            var overlapped = false;
             for (non_overlapped.items) |*n| {
                 if (seg.overlap(n)) {
                     n.weight += seg.weight;
+                    overlapped = true;
                 } else {
-                    break;
+                    if (overlapped) {
+                        break;
+                    }
                 }
             }
         }
@@ -473,6 +486,8 @@ const ParaTree = struct {
     }
 
     fn calAverageWeight(segs: *std.ArrayList(Seg)) f32 {
+        if (segs.items.len == 0)
+            return 0.0;
         var sum:usize = 0;
         for (segs.items) |s| {
             sum += s.weight;
@@ -480,27 +495,47 @@ const ParaTree = struct {
         return @as(f32, @floatFromInt(sum)) / @as(f32, @floatFromInt(segs.items.len));
     }
 
-    fn calEff(comptime T:type, segs: *std.ArrayList(Seg)) !f32 {
+    fn calEff(comptime T:type, segs: *const std.ArrayList(Seg)) !CutInfo {
         var large_segs = std.ArrayList(Seg).init(allocator);
         defer large_segs.deinit();
         var small_segs = std.ArrayList(Seg).init(allocator);
         defer small_segs.deinit();
+        var n_large:usize = 0;
+        var n_small:usize = 0;
 
         for (segs.items) |seg| {
             const r = truncateRange(T, seg.range);
             if (r.isLarge()) {
                 try large_segs.append(Seg{.range = .{.lo = r.lo, .hi = r.hi}, .weight = seg.weight});
+                n_large += seg.weight;
             } else {
                 try small_segs.append(Seg{.range = .{.lo = r.lo, .hi = r.hi}, .weight = seg.weight});
+                n_small += seg.weight;
             }
         }
 
-        var large = try genWeightedSeg(&large_segs);
-        defer large.deinit();
-        var small = try genWeightedSeg(&small_segs);
-        defer small.deinit();
+        var eff:f32 = 0;
+        var large: ?std.ArrayList(Seg) = null;
+        var small: ?std.ArrayList(Seg) = null;
+        //print("large: {}\n", .{large_segs.items.len});
+        if (large_segs.items.len != 0) {
+            large = try genWeightedSeg(&large_segs);
+            //print("non\n", .{});
+            //dumpSegs(&large.?);
+            const large_ratio = @as(f32, @floatFromInt(n_large)) / @as(f32, @floatFromInt(n_large + n_small));
+            eff += calAverageWeight(&large.?) * large_ratio;
+        }
 
-        return @min(calAverageWeight(&large), calAverageWeight(&small));
+        //print("small: {}\n", .{small_segs.items.len});
+        if (small_segs.items.len != 0) {
+            small = try genWeightedSeg(&small_segs);
+            //print("non\n", .{});
+            //dumpSegs(&small.?);
+            const small_ratio = @as(f32, @floatFromInt(n_small)) / @as(f32, @floatFromInt(n_large + n_small));
+            eff += calAverageWeight(&small.?) * small_ratio;
+        }
+
+        return CutInfo{.eff = eff, .large_non = large, .small_non = small};
     }
 
     test {
@@ -508,51 +543,125 @@ const ParaTree = struct {
         defer segs.deinit();
         try segs.append(Seg{.range = .{.lo = 0, .hi = std.math.maxInt(u32)}, .weight = 10});
         try segs.append(Seg{.range = .{.lo = 0, .hi = 0}, .weight = 20});
-        const non = try calEff(u8, &segs);
-        try expect(non == 10.0);
+        const cutinfo = try calEff(u8, &segs);
+        cutinfo.large_non.?.deinit();
+        cutinfo.small_non.?.deinit();
+
+        try expect(cutinfo.eff - 16.66666 < 0.00001);
     }
 
-    const cut_kinds = @typeInfo(CutTag).Enum.fields.len;
-    fn vectorizedCut(segs: *std.ArrayList(Seg)) [cut_kinds]CutEff {
-        var idx:usize = 0;
-        while (idx < cut_kinds) : (idx += 1) {
-            const cut:CutTag = @enumFromInt(idx);
-            switch (cut) {
-                .u8x16 => _ = calEff(u8, segs),
-            }
-        }
-        return undefined;
-    }
-
-    const DimAndCut = struct {
-        dim: u8,
-        cut: CutTag,
+    const CutInfo = struct {
+        large_non : ?std.ArrayList(Seg),
+        small_non : ?std.ArrayList(Seg),
+        eff: f32,
     };
 
-    fn choose(self: *ParaTree, dim_segs: *[Dim]std.ArrayList(Seg)) DimAndCut {
-        var i:usize = 0;
-        while (i < Dim) : (i += 1) {
-            dim_segs[i] = std.ArrayList(Seg).init(allocator);
-            for (self.root.rules) |r| {
-                dim_segs[i].append(Seg{ .range = r.ranges[i] });
+    const cut_kinds = @typeInfo(CutTag).Enum.fields.len;
+    fn vectorizedCut(segs: *const std.ArrayList(Seg)) ![cut_kinds]CutInfo {
+        var idx:usize = 0;
+        var cut_info:[cut_kinds]CutInfo = undefined;
+
+        while (idx < cut_kinds) : (idx += 1) {
+
+            const cut:CutTag = @enumFromInt(idx);
+            switch (cut) {
+                .u8x16 => cut_info[idx] = try calEff(u8, segs),
+                .u16x8 => cut_info[idx] = try calEff(u16, segs),
+                .u32x4 => cut_info[idx] = try calEff(u32, segs),
             }
-            getUniq(Seg).uniq(&dim_segs[i], false);
-            vectorizedCut(&dim_segs[i]);
         }
-        return undefined;
+        for (0 .. cut_kinds) |i| {
+            print("{} {}\n", .{@as(CutTag, @enumFromInt(i)), cut_info[i].eff});
+        }
+
+        return cut_info;
     }
 
-    //fn build(self: *ParaTree) void {
-    //    var dim_ranges : [Dim]std.ArrayList(Seg) = undefined;
-    //    defer {
-    //        var i = 0;
-    //        while (i < Dim) : (i += 1) {
-    //            dim_ranges[i].deinit();
-    //        }
-    //    }
+    test {
+        var segs = std.ArrayList(Seg).init(allocator);
+        defer segs.deinit();
+        try segs.append(Seg{.range = .{.lo = 0, .hi = std.math.maxInt(u32)}, .weight = 10});
+        try segs.append(Seg{.range = .{.lo = 0, .hi = 0}, .weight = 20});
+        const cut = try vectorizedCut(&segs);
+        try expect(cut[0].eff - 16.66666 < 0.00001);
+        try expect(cut[1].eff - 16.66666 < 0.00001);
+        try expect(cut[2].eff - 16.66666 < 0.00001);
+        cut[0].large_non.?.deinit();
+        cut[0].small_non.?.deinit();
 
-    //    const dim = choose(self, &dim_ranges);
-    //}
+        cut[1].large_non.?.deinit();
+        cut[1].small_non.?.deinit();
+
+        cut[2].large_non.?.deinit();
+        cut[2].small_non.?.deinit();
+    }
+
+    const DimCut = struct {
+        dim: u8,
+        cut: CutTag,
+        eff: f32,
+        large_non: ?std.ArrayList(Seg),
+        small_non: ?std.ArrayList(Seg),
+    };
+
+    fn pickDim(dc: *?DimCut, cut_infos: []const CutInfo, dim: u8) void {
+        var min:f32 = std.math.floatMax(f32);
+        var idx:usize = 0;
+        for(0.., cut_infos) |i, ci| {
+            if (min > ci.eff) {
+                min = ci.eff;
+                idx = i;
+            }
+        }
+
+        for (0.., cut_infos) |i, *ci| {
+            if (i != idx) {
+                if (ci.large_non) |a| {
+                    a.deinit();
+                }
+                if (ci.small_non) |a| {
+                    a.deinit();
+                }
+            }
+        }
+
+        if (((dc.* != null) and (min < dc.*.?.eff)) or dc.* == null) {
+            dc.* = DimCut{.dim = dim, .cut = @enumFromInt(idx),
+                .large_non = cut_infos[idx].large_non,
+                .small_non = cut_infos[idx].small_non,
+                .eff = min};
+        }
+    }
+
+    fn choose(self: *ParaTree, dim_segs: *[Dim]std.ArrayList(Seg)) !DimCut {
+        var i:u8 = 0;
+        var dc: ?DimCut = null;
+
+        while (i < Dim) : (i += 1) {
+            dim_segs[i] = std.ArrayList(Seg).init(allocator);
+            for (self.root.rules.items) |r| {
+                try dim_segs[i].append(Seg{ .range = r.ranges[i] });
+            }
+            getUniq(Seg).uniq(&dim_segs[i], false);
+            print("dim {}\n", .{i});
+            const cut_infos = try vectorizedCut(&dim_segs[i]);
+            pickDim(&dc, &cut_infos, i);
+        }
+        return dc.?;
+    }
+
+    fn build(self: *ParaTree) !void {
+        var dim_segs : [Dim]std.ArrayList(Seg) = undefined;
+        defer {
+            var i:usize = 0;
+            while (i < Dim) : (i += 1) {
+                dim_segs[i].deinit();
+            }
+        }
+
+        const dim = try choose(self, &dim_segs);
+        _ = dim;
+    }
 };
 
 fn paraCut(rule_list : *std.ArrayList(Rule)) !ParaTree {
@@ -563,7 +672,7 @@ fn paraCut(rule_list : *std.ArrayList(Rule)) !ParaTree {
         try tree.root.rules.append(r);
     }
 
-    //tree.build();
+    try tree.build();
     return tree;
 }
 
