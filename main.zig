@@ -171,26 +171,15 @@ const CutTag = enum {
 const ParaCuts = union(CutTag) {
     u8x16: struct {
         cuts: @Vector(16, u8),
-        shift: [17]u8,
     },
 
     u16x8: struct {
         cuts: @Vector(8, u16),
-        shift: [9]u8,
     },
 
     u32x4: struct {
         cuts: @Vector(4, u32),
-        shift: [5]u8,
     },
-};
-
-const ParaNode = struct {
-    cuts : ParaCuts,
-    dim : u8,
-    is_leaf: bool,
-    next: []ParaNode,
-    rules: std.ArrayList(*Rule),
 };
 
 const Seg = struct {
@@ -261,7 +250,7 @@ test {
 }
 
 test {
-    _ = ParaTree;
+    _ = ParaNode;
 }
 
 const NextCut = struct {
@@ -316,9 +305,10 @@ const NextCut = struct {
         self.cut.lo = non.items[self.start_idx].range.lo;
     }
 
-    fn nextCutHi(self: *NextCut, non: *const std.ArrayList(Seg)) void {
-        if (self.start_idx == non.items.len - 1) {
-            self.cut.hi = non.items[self.start_idx].range.hi;
+    fn nextCutHi(self: *NextCut, non: *const std.ArrayList(Seg), last_cut: bool) void {
+        if (self.start_idx == non.items.len - 1 or last_cut) {
+            const last_hi = non.items[non.items.len - 1].range.hi;
+            self.cut.hi = last_hi;
         } else {
             self.cut.hi = non.items[self.start_idx + 1].range.lo - 1;
         }
@@ -331,11 +321,11 @@ const NextCut = struct {
     }
 
     fn searchCut(self: *NextCut, segs: *const std.ArrayList(Seg),
-        non: *const std.ArrayList(Seg), t: f32) !void {
+        non: *const std.ArrayList(Seg), t: f32, last_cut: bool) !void {
         self.nextCutLo(non);
 
         while (true) {
-           self.nextCutHi(non);
+           self.nextCutHi(non, last_cut);
            try self.doCut(segs);
            //print("cuts {} {} {}\n", .{self.curr_rules, self.cut, self.start_idx});
 
@@ -345,17 +335,15 @@ const NextCut = struct {
            }
         }
     }
-
-    fn lastCut(self: *NextCut, segs: *const std.ArrayList(Seg), non: *const std.ArrayList(Seg),
-               size: u32) !void {
-        self.nextCutLo(non);
-        self.cut.hi = size;
-        try self.doCut(segs);
-    }
 };
 
-const ParaTree = struct {
-    root: ParaNode,
+const ParaNode = struct {
+    dim : u8,
+    small_mask: u16,
+    cuts : ParaCuts,
+    cube: [Dim]Range,
+    next: []ParaNode,
+    rules: std.ArrayList(*Rule),
 
     const Order = std.math.Order;
     fn lessThan(_ : void, a: u32, b: u32) Order {
@@ -544,8 +532,7 @@ const ParaTree = struct {
         }
     }
 
-
-    fn searchCuts(segs: *std.ArrayList(Seg), n_cuts: u8, n_rules: usize, size: u32) !std.ArrayList(Seg) {
+    fn searchCuts(segs: *std.ArrayList(Seg), n_cuts: u8, n_rules: usize) !std.ArrayList(Seg) {
         getUniq(Seg).uniq(segs, true);
         //dumpSegs(segs, "uniq");
         const non = try genNonOverlappedSegs(segs);
@@ -560,15 +547,11 @@ const ParaTree = struct {
 
         var cut_segs = std.ArrayList(Seg).init(allocator);
 
-        while (i < n_cuts and nextcut.hasNext(&non)) : (i += 1) {
-            try nextcut.searchCut(segs, &non, t);
+        while (i < n_cuts + 1 and nextcut.hasNext(&non)) : (i += 1) {
+            try nextcut.searchCut(segs, &non, t, i == n_cuts);
             try cut_segs.append(Seg{ .range = nextcut.cut, .weight = nextcut.curr_rules});
         }
 
-        if (nextcut.hasNext(&non)) {
-            try nextcut.lastCut(segs, &non, size);
-            try cut_segs.append(Seg{ .range = nextcut.cut, .weight = nextcut.curr_rules});
-        }
         return cut_segs;
     }
 
@@ -627,15 +610,15 @@ const ParaTree = struct {
         //print("{} {}\n", .{n_large_cuts, n_small_cuts});
 
         if (n_large_cuts != 0) {
-            large = try searchCuts(&large_segs, n_large_cuts, n_large, trunc_size);
-            //dumpSegs(&large.?, "large cut");
+            large = try searchCuts(&large_segs, n_large_cuts, n_large);
+            dumpSegs(&large.?, "large cut");
             const large_ratio = @as(f32, @floatFromInt(n_large)) / @as(f32, @floatFromInt(n_large + n_small));
             eff += calAverageWeight(&large.?) * large_ratio;
         }
 
         if (n_small_cuts != 0) {
-            small = try searchCuts(&small_segs,  n_small_cuts, n_small, trunc_size);
-            //dumpSegs(&small.?, "small cut");
+            small = try searchCuts(&small_segs,  n_small_cuts, n_small);
+            dumpSegs(&small.?, "small cut");
             const small_ratio = @as(f32, @floatFromInt(n_small)) / @as(f32, @floatFromInt(n_large + n_small));
             eff += calAverageWeight(&small.?) * small_ratio;
         }
@@ -676,9 +659,9 @@ const ParaTree = struct {
                 .u32x4 => cut_info[idx] = try cutDim(u32, segs, dim_info.size, nCuts[idx]),
             }
         }
-        for (0 .. cut_kinds) |i| {
-            print("{} {d:.2}\n", .{@as(CutTag, @enumFromInt(i)), cut_info[i].eff});
-        }
+        //for (0 .. cut_kinds) |i| {
+        //    print("{} {d:.2}\n", .{@as(CutTag, @enumFromInt(i)), cut_info[i].eff});
+        //}
 
         return cut_info;
     }
@@ -710,11 +693,12 @@ const ParaTree = struct {
         small_cuts: ?std.ArrayList(Seg),
     };
 
-    fn pickDim(dc: *?DimCut, cut_infos: []const CutInfo, dim: u8) void {
+    fn pickCut(dc: *?DimCut, cut_infos: []const CutInfo, dim: u8) void {
         var min:f32 = std.math.floatMax(f32);
         var idx:usize = 0;
         for(0.., cut_infos) |i, ci| {
-            if (min > ci.eff) {
+            // NOTE: >= means we prefer "deep" cut to "shallow" one.
+            if (min >= ci.eff) {
                 min = ci.eff;
                 idx = i;
             }
@@ -739,24 +723,25 @@ const ParaTree = struct {
         }
     }
 
-    fn choose(self: *ParaTree, dim_segs: *[Dim]std.ArrayList(Seg), dim_info: []const DimInfo) !DimCut {
+    fn choose(self: *ParaNode, dim_segs: *[Dim]std.ArrayList(Seg), dim_info: []const DimInfo) !DimCut {
         var i:u8 = 0;
         var dc: ?DimCut = null;
 
         while (i < Dim) : (i += 1) {
             dim_segs[i] = std.ArrayList(Seg).init(allocator);
-            for (self.root.rules.items) |r| {
+            for (self.rules.items) |r| {
                 try dim_segs[i].append(Seg{ .range = r.ranges[i] });
             }
             getUniq(Seg).uniq(&dim_segs[i], false);
-            print("dim {}\n", .{i});
+            //print("dim {}\n", .{i});
             const cut_infos = try vectorizedCut(&dim_segs[i], &dim_info[i]);
-            pickDim(&dc, &cut_infos, i);
+            pickCut(&dc, &cut_infos, i);
         }
+        print("pick {} {} {d:.2}\n", .{dc.?.dim, dc.?.cut, dc.?.eff});
         return dc.?;
     }
 
-    fn build(self: *ParaTree, dim_info:[]const DimInfo) !void {
+    fn build(self: *ParaNode, dim_info:[]const DimInfo) !void {
         var dim_segs : [Dim]std.ArrayList(Seg) = undefined;
         defer {
             var i:usize = 0;
@@ -764,9 +749,32 @@ const ParaTree = struct {
                 dim_segs[i].deinit();
             }
         }
+        const dc = try choose(self, &dim_segs, dim_info);
+        //self.pushRules(&dc, &dim_info[dc.dim]);
+        _ = dc;
+    }
 
-        const dim = try choose(self, &dim_segs, dim_info);
-        _ = dim;
+    fn pushRules(self: *ParaNode, dc: *const DimCut, di: *const DimInfo) void {
+        //for (self.rules.items) |rule| {
+        //    const range = &rule.ranges[dc.dim];
+        //    if (!range.isLarge(di.size)) {
+        //        for (dc.small_cuts.items) |cut_seg| {
+        //            if (cut_seg.range.overlap(range)) {
+        //            }
+        //        }
+        //    }
+        //}
+        _ = self;
+        _ = dc;
+        _ = di;
+    }
+};
+
+const ParaTree = struct {
+    root: ParaNode,
+
+    fn build(self: *ParaTree, dim_info:[]const DimInfo) !void {
+        try self.root.build(dim_info);
     }
 };
 
