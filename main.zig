@@ -122,7 +122,14 @@ test {
     try expect(r1.hi == 0x11);
 }
 
-fn truncateRange(comptime T: type, r: Range) Range {
+fn truncateRange(comptime T: type, r: Range, size: u32) Range {
+    if (std.math.maxInt(T) >= size) {
+        return Range {
+            .lo = r.lo,
+            .hi = r.hi,
+        };
+    }
+
     switch (T) {
         u32 => return Range {
             .lo = r.lo,
@@ -330,13 +337,20 @@ const NextCut = struct {
         while (true) {
            self.nextCutHi(non);
            try self.doCut(segs);
-           //print("cuts {} {}\n", .{self.curr_rules, self.cut});
+           //print("cuts {} {} {}\n", .{self.curr_rules, self.cut, self.start_idx});
 
            if (@as(f32, @floatFromInt(self.curr_rules)) >= t
                or !self.hasNext(non)) {
                break;
            }
         }
+    }
+
+    fn lastCut(self: *NextCut, segs: *const std.ArrayList(Seg), non: *const std.ArrayList(Seg),
+               size: u32) !void {
+        self.nextCutLo(non);
+        self.cut.hi = size;
+        try self.doCut(segs);
     }
 };
 
@@ -531,13 +545,13 @@ const ParaTree = struct {
     }
 
 
-    fn searchCuts(segs: *std.ArrayList(Seg), n_cuts: u8, n_rules: usize) !std.ArrayList(Seg) {
+    fn searchCuts(segs: *std.ArrayList(Seg), n_cuts: u8, n_rules: usize, size: u32) !std.ArrayList(Seg) {
         getUniq(Seg).uniq(segs, true);
-        //dumpSegs(segs, "non");
+        //dumpSegs(segs, "uniq");
         const non = try genNonOverlappedSegs(segs);
 
         const t:f32 = @as(f32, @floatFromInt(n_rules)) / @as(f32, @floatFromInt(n_cuts + 1));
-        print("t {d:.2}\n", .{t});
+        //print("t {d:.2}\n", .{t});
         var i:usize = 0;
 
         var nextcut = NextCut{};
@@ -548,6 +562,11 @@ const ParaTree = struct {
 
         while (i < n_cuts and nextcut.hasNext(&non)) : (i += 1) {
             try nextcut.searchCut(segs, &non, t);
+            try cut_segs.append(Seg{ .range = nextcut.cut, .weight = nextcut.curr_rules});
+        }
+
+        if (nextcut.hasNext(&non)) {
+            try nextcut.lastCut(segs, &non, size);
             try cut_segs.append(Seg{ .range = nextcut.cut, .weight = nextcut.curr_rules});
         }
         return cut_segs;
@@ -580,7 +599,7 @@ const ParaTree = struct {
         const trunc_size = truncateSize(T, size);
 
         for (segs.items) |seg| {
-            const r = truncateRange(T, seg.range);
+            const r = truncateRange(T, seg.range, size);
             if (r.isLarge(trunc_size)) {
                 try large_segs.append(Seg{.range = .{.lo = r.lo, .hi = r.hi}, .weight = seg.weight});
                 n_large += seg.weight;
@@ -608,15 +627,15 @@ const ParaTree = struct {
         //print("{} {}\n", .{n_large_cuts, n_small_cuts});
 
         if (n_large_cuts != 0) {
-            large = try searchCuts(&large_segs, n_large_cuts, n_large);
-            dumpSegs(&large.?, "large cut");
+            large = try searchCuts(&large_segs, n_large_cuts, n_large, trunc_size);
+            //dumpSegs(&large.?, "large cut");
             const large_ratio = @as(f32, @floatFromInt(n_large)) / @as(f32, @floatFromInt(n_large + n_small));
             eff += calAverageWeight(&large.?) * large_ratio;
         }
 
         if (n_small_cuts != 0) {
-            small = try searchCuts(&small_segs,  n_small_cuts, n_small);
-            dumpSegs(&small.?, "small cut");
+            small = try searchCuts(&small_segs,  n_small_cuts, n_small, trunc_size);
+            //dumpSegs(&small.?, "small cut");
             const small_ratio = @as(f32, @floatFromInt(n_small)) / @as(f32, @floatFromInt(n_large + n_small));
             eff += calAverageWeight(&small.?) * small_ratio;
         }
@@ -648,33 +667,17 @@ const ParaTree = struct {
     fn vectorizedCut(segs: *const std.ArrayList(Seg), dim_info:*const DimInfo) ![cut_kinds]CutInfo {
         var idx:usize = 0;
         var cut_info:[cut_kinds]CutInfo = undefined;
-        const empty = CutInfo { .eff = std.math.floatMax(f32),
-                              .large_cuts = null,
-                              .small_cuts = null };
 
         while (idx < cut_kinds) : (idx += 1) {
-
             const cut:CutTag = @enumFromInt(idx);
             switch (cut) {
-                .u8x16 => {
-                    if (dim_info.size >= std.math.maxInt(u8)) {
-                        cut_info[idx] = try cutDim(u8, segs, dim_info.size, nCuts[idx]);
-                    } else {
-                        cut_info[idx] = empty;
-                    }
-                },
-                .u16x8 => {
-                    if (dim_info.size >= std.math.maxInt(u16)) {
-                        cut_info[idx] = try cutDim(u16, segs, dim_info.size, nCuts[idx]);
-                    } else {
-                        cut_info[idx] = empty;
-                    }
-                },
+                .u8x16 => cut_info[idx] = try cutDim(u8, segs, dim_info.size, nCuts[idx]),
+                .u16x8 => cut_info[idx] = try cutDim(u16, segs, dim_info.size, nCuts[idx]),
                 .u32x4 => cut_info[idx] = try cutDim(u32, segs, dim_info.size, nCuts[idx]),
             }
         }
         for (0 .. cut_kinds) |i| {
-            print("{} {}\n", .{@as(CutTag, @enumFromInt(i)), cut_info[i].eff});
+            print("{} {d:.2}\n", .{@as(CutTag, @enumFromInt(i)), cut_info[i].eff});
         }
 
         return cut_info;
