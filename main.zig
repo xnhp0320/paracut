@@ -20,6 +20,18 @@ const Range = struct {
             return self.hi < other.hi;
         return self.lo < other.lo;
     }
+
+    fn isLarge(self: Range, size: u32) bool {
+        // 0.05 ~ 1/16 is a /4 prefix for u8, u16 and u32 is large enough.
+        return @as(f32, @floatFromInt(self.hi - self.lo +| 1)) / @as(f32, @floatFromInt(size)) > 0.05;
+    }
+
+    fn overlap(self: *const Range, other: *const Range) bool {
+        if (self.hi < other.lo or self.lo > other.hi) {
+            return false;
+        }
+        return true;
+    }
 };
 
 const Prefix = struct {
@@ -110,36 +122,21 @@ test {
     try expect(r1.hi == 0x11);
 }
 
-fn RangeType(comptime T: type) type {
-    return struct {
-        lo : T,
-        hi : T,
-        size : T,
-
-        fn isLarge(self: @This()) bool {
-            // 0.05 ~ 1/16 is a /4 prefix for u8, u16 and u32 is large enough.
-            return @as(f32, @floatFromInt(self.hi - self.lo +| 1)) / @as(f32, @floatFromInt(self.size)) > 0.05;
-        }
-    };
-}
-
-fn truncateRange(comptime T: type, r: Range) RangeType(T) {
+fn truncateRange(comptime T: type, r: Range) Range {
     switch (T) {
-        u32 => return RangeType(u32) {
+        u32 => return Range {
             .lo = r.lo,
             .hi = r.hi,
-            .size = std.math.maxInt(u32),
-        },
-        u16 => return RangeType(u16) {
-            .lo = @truncate((r.lo & 0xFFFF0000) >> 16),
-            .hi = @truncate((r.hi & 0xFFFF0000) >> 16),
-            .size = std.math.maxInt(u16),
         },
 
-        u8 => return RangeType(u8) {
+        u16 => return Range {
+            .lo = @truncate((r.lo & 0xFFFF0000) >> 16),
+            .hi = @truncate((r.hi & 0xFFFF0000) >> 16),
+        },
+
+        u8 => return Range {
             .lo = @truncate((r.lo & 0xFF000000) >> 24),
             .hi = @truncate((r.hi & 0xFF000000) >> 24),
-            .size = std.math.maxInt(u8),
         },
 
         else => unreachable,
@@ -191,7 +188,7 @@ const ParaNode = struct {
 
 const Seg = struct {
     range : Range,
-    weight: usize = 0,
+    weight: u32 = 0,
 
     fn eq(self: Seg, other: Seg) bool {
         return self.range.eq(other.range);
@@ -204,10 +201,7 @@ const Seg = struct {
     fn overlap(self: *const Seg, other: *const Seg) bool {
         const s = &self.range;
         const o = &other.range;
-        if (s.hi < o.lo or s.lo > o.hi) {
-            return false;
-        }
-        return true;
+        return s.overlap(o);
     }
 };
 
@@ -262,6 +256,84 @@ test {
 test {
     _ = ParaTree;
 }
+
+const NextCut = struct {
+    const W = struct {
+        v : u32,
+        w : u32,
+    };
+
+    const Order = std.math.Order;
+    fn lessThan(_ : void, a: W, b: W) Order {
+        return std.math.order(a.v, b.v);
+    }
+
+    const PQlt = std.PriorityQueue(W, void, lessThan);
+
+    curr_rules: u32 = 0,
+    cut: Range = undefined,
+    seg_idx: usize = 0,
+    start_idx: usize = 0,
+    h: PQlt = undefined,
+
+    fn init(self: *NextCut) void {
+        self.h = PQlt.init(allocator, {});
+    }
+
+    fn deinit(self: *NextCut) void {
+        self.h.deinit();
+    }
+
+    fn doCut(self: *NextCut, segs: *const std.ArrayList(Seg)) !void {
+        while(self.h.peek()) |top| {
+            if (top.v < self.cut.lo) {
+                const w = self.h.remove();
+                self.curr_rules -= w.w;
+            } else {
+                break;
+            }
+        }
+
+        while (self.seg_idx < segs.items.len) : (self.seg_idx += 1) {
+            const seg = &segs.items[self.seg_idx];
+            if (seg.range.lo <= self.cut.hi) {
+                self.curr_rules += seg.weight;
+                try self.h.add(W{.v = seg.range.hi, .w = seg.weight});
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn nextCutLo(self: *NextCut, non: *const std.ArrayList(Seg)) void {
+        self.cut.lo = non.items[self.start_idx].range.lo;
+    }
+
+    fn nextCutHi(self: *NextCut, non: *const std.ArrayList(Seg)) void {
+        if (self.start_idx == non.items.len - 1) {
+            self.cut.hi = non.items[self.start_idx].range.hi;
+        } else {
+            self.cut.hi = non.items[self.start_idx + 1].range.lo - 1;
+        } 
+        self.start_idx += 1;
+    }
+
+    fn hasNext(self: *NextCut, non: *const std.ArrayList(Seg)) bool {
+        return self.start_idx < non.items.len;
+
+    }
+
+    fn searchCut(self: *NextCut, segs: *const std.ArrayList(Seg),
+        non: *const std.ArrayList(Seg), t: f32) !void {
+        self.nextCutLo(non);
+
+        while (@as(f32, @floatFromInt(self.curr_rules)) < t
+                and self.hasNext(non)) {
+           self.nextCutHi(non);
+           try self.doCut(segs);
+        }
+    }
+};
 
 const ParaTree = struct {
     root: ParaNode,
@@ -446,43 +518,32 @@ const ParaTree = struct {
 
     }
 
-    fn dumpSegs(segs: *const std.ArrayList(Seg)) void {
+    fn dumpSegs(segs: *const std.ArrayList(Seg), desc: []u8) void {
+        print("{s}\n", .{desc});
         for (segs.items) |s| {
             print("{}\n", .{s});
         }
     }
 
-    fn genWeightedSeg(segs: *std.ArrayList(Seg)) !std.ArrayList(Seg) {
+    
+    fn searchCuts(segs: *std.ArrayList(Seg), n_cuts: u8, n_rules: usize) !std.ArrayList(Seg) {
         getUniq(Seg).uniq(segs, true);
-        //print("origin segs:\n", .{});
-        //dumpSegs(segs);
-        const non_overlapped = try genNonOverlappedSegs(segs);
-        for (segs.items) |*seg| {
-            var overlapped = false;
-            for (non_overlapped.items) |*n| {
-                if (seg.overlap(n)) {
-                    n.weight += seg.weight;
-                    overlapped = true;
-                } else {
-                    if (overlapped) {
-                        break;
-                    }
-                }
-            }
-        }
-        return non_overlapped;
-    }
+        const non = try genNonOverlappedSegs(segs); 
 
-    test {
-        var segs = std.ArrayList(Seg).init(allocator);
-        defer segs.deinit();
-        try segs.append(Seg{.range = .{.lo = 0, .hi = std.math.maxInt(u32)}, .weight = 10});
-        try segs.append(Seg{.range = .{.lo = 0, .hi = 0}, .weight = 20});
-        const non = try genWeightedSeg(&segs);
-        defer non.deinit();
-        try expect(non.items.len == 2);
-        try expect(non.items[0].weight == 30);
-        try expect(non.items[1].weight == 10);
+        const  t:f32 = @as(f32, @floatFromInt(n_rules)) / @as(f32, @floatFromInt(n_cuts + 1));
+        var i:usize = 0;
+
+        var nextcut = NextCut{};
+        nextcut.init();
+        defer nextcut.deinit();
+
+        var cut_segs = std.ArrayList(Seg).init(allocator);
+        
+        while (i < n_cuts and nextcut.hasNext(&non)) : (i += 1) {
+            try nextcut.searchCut(segs, &non, t);
+            try cut_segs.append(Seg{ .range = nextcut.cut, .weight = nextcut.curr_rules});
+        }
+        return cut_segs;
     }
 
     fn calAverageWeight(segs: *std.ArrayList(Seg)) f32 {
@@ -495,7 +556,13 @@ const ParaTree = struct {
         return @as(f32, @floatFromInt(sum)) / @as(f32, @floatFromInt(segs.items.len));
     }
 
-    fn calEff(comptime T:type, segs: *const std.ArrayList(Seg)) !CutInfo {
+    const nLargeCuts = 1;
+    
+    fn truncateSize(comptime T: type, size: u32) u32 {
+        return @min(size, std.math.maxInt(T));
+    }
+
+    fn cutDim(comptime T:type, segs: *const std.ArrayList(Seg), size: u32, n_cuts: u8) !CutInfo {
         var large_segs = std.ArrayList(Seg).init(allocator);
         defer large_segs.deinit();
         var small_segs = std.ArrayList(Seg).init(allocator);
@@ -503,9 +570,11 @@ const ParaTree = struct {
         var n_large:usize = 0;
         var n_small:usize = 0;
 
+        const trunc_size = truncateSize(T, size);
+
         for (segs.items) |seg| {
             const r = truncateRange(T, seg.range);
-            if (r.isLarge()) {
+            if (r.isLarge(trunc_size)) {
                 try large_segs.append(Seg{.range = .{.lo = r.lo, .hi = r.hi}, .weight = seg.weight});
                 n_large += seg.weight;
             } else {
@@ -517,25 +586,35 @@ const ParaTree = struct {
         var eff:f32 = 0;
         var large: ?std.ArrayList(Seg) = null;
         var small: ?std.ArrayList(Seg) = null;
-        //print("large: {}\n", .{large_segs.items.len});
-        if (large_segs.items.len != 0) {
-            large = try genWeightedSeg(&large_segs);
-            //print("non\n", .{});
-            //dumpSegs(&large.?);
+
+        var n_large_cuts:u8 = 0;
+        var n_small_cuts:u8 = 0;
+
+        if (large_segs.items.len != 0 and small_segs.items.len != 0) {
+            n_large_cuts = nLargeCuts;  
+            n_small_cuts = n_cuts - nLargeCuts;
+        } else if (large_segs.items.len != 0) {
+            n_large_cuts = n_cuts;
+        } else {
+            n_small_cuts = n_cuts;
+        }
+        //print("{} {}\n", .{n_large_cuts, n_small_cuts});
+
+        if (n_large_cuts != 0) {
+            large = try searchCuts(&large_segs, n_large_cuts, n_large);
+            //dumpSegs(&large.?, "large cut");
             const large_ratio = @as(f32, @floatFromInt(n_large)) / @as(f32, @floatFromInt(n_large + n_small));
             eff += calAverageWeight(&large.?) * large_ratio;
         }
 
-        //print("small: {}\n", .{small_segs.items.len});
-        if (small_segs.items.len != 0) {
-            small = try genWeightedSeg(&small_segs);
-            //print("non\n", .{});
-            //dumpSegs(&small.?);
+        if (n_small_cuts != 0) {
+            small = try searchCuts(&small_segs,  n_small_cuts, n_small);
+            //dumpSegs(&small.?, "small cut");
             const small_ratio = @as(f32, @floatFromInt(n_small)) / @as(f32, @floatFromInt(n_large + n_small));
             eff += calAverageWeight(&small.?) * small_ratio;
         }
 
-        return CutInfo{.eff = eff, .large_non = large, .small_non = small};
+        return CutInfo{.eff = eff, .large_cuts = large, .small_cuts = small};
     }
 
     test {
@@ -543,31 +622,48 @@ const ParaTree = struct {
         defer segs.deinit();
         try segs.append(Seg{.range = .{.lo = 0, .hi = std.math.maxInt(u32)}, .weight = 10});
         try segs.append(Seg{.range = .{.lo = 0, .hi = 0}, .weight = 20});
-        const cutinfo = try calEff(u8, &segs);
-        cutinfo.large_non.?.deinit();
-        cutinfo.small_non.?.deinit();
+        const cutinfo = try cutDim(u8, &segs, std.math.maxInt(u8), 2);
+        cutinfo.large_cuts.?.deinit();
+        cutinfo.small_cuts.?.deinit();
 
         try expect(cutinfo.eff - 16.66666 < 0.00001);
     }
 
     const CutInfo = struct {
-        large_non : ?std.ArrayList(Seg),
-        small_non : ?std.ArrayList(Seg),
+        large_cuts : ?std.ArrayList(Seg),
+        small_cuts : ?std.ArrayList(Seg),
         eff: f32,
     };
 
+    
+    const nCuts = [_]u8{ 16, 8, 4};
     const cut_kinds = @typeInfo(CutTag).Enum.fields.len;
-    fn vectorizedCut(segs: *const std.ArrayList(Seg)) ![cut_kinds]CutInfo {
+    fn vectorizedCut(segs: *const std.ArrayList(Seg), dim_info:*const DimInfo) ![cut_kinds]CutInfo {
         var idx:usize = 0;
         var cut_info:[cut_kinds]CutInfo = undefined;
+        const empty = CutInfo { .eff = std.math.floatMax(f32),
+                              .large_cuts = null,
+                              .small_cuts = null };
 
         while (idx < cut_kinds) : (idx += 1) {
 
             const cut:CutTag = @enumFromInt(idx);
             switch (cut) {
-                .u8x16 => cut_info[idx] = try calEff(u8, segs),
-                .u16x8 => cut_info[idx] = try calEff(u16, segs),
-                .u32x4 => cut_info[idx] = try calEff(u32, segs),
+                .u8x16 => {
+                    if (dim_info.size >= std.math.maxInt(u8)) {
+                        cut_info[idx] = try cutDim(u8, segs, dim_info.size, nCuts[idx]);
+                    } else {
+                        cut_info[idx] = empty;
+                    }
+                },
+                .u16x8 => {
+                    if (dim_info.size >= std.math.maxInt(u16)) {
+                        cut_info[idx] = try cutDim(u16, segs, dim_info.size, nCuts[idx]);
+                    } else {
+                        cut_info[idx] = empty;
+                    }
+                },
+                .u32x4 => cut_info[idx] = try cutDim(u32, segs, dim_info.size, nCuts[idx]),
             }
         }
         for (0 .. cut_kinds) |i| {
@@ -582,26 +678,26 @@ const ParaTree = struct {
         defer segs.deinit();
         try segs.append(Seg{.range = .{.lo = 0, .hi = std.math.maxInt(u32)}, .weight = 10});
         try segs.append(Seg{.range = .{.lo = 0, .hi = 0}, .weight = 20});
-        const cut = try vectorizedCut(&segs);
+        const cut = try vectorizedCut(&segs, &DimInfo{.size = std.math.maxInt(u32)});
         try expect(cut[0].eff - 16.66666 < 0.00001);
         try expect(cut[1].eff - 16.66666 < 0.00001);
         try expect(cut[2].eff - 16.66666 < 0.00001);
-        cut[0].large_non.?.deinit();
-        cut[0].small_non.?.deinit();
+        cut[0].large_cuts.?.deinit();
+        cut[0].small_cuts.?.deinit();
 
-        cut[1].large_non.?.deinit();
-        cut[1].small_non.?.deinit();
+        cut[1].large_cuts.?.deinit();
+        cut[1].small_cuts.?.deinit();
 
-        cut[2].large_non.?.deinit();
-        cut[2].small_non.?.deinit();
+        cut[2].large_cuts.?.deinit();
+        cut[2].small_cuts.?.deinit();
     }
 
     const DimCut = struct {
         dim: u8,
         cut: CutTag,
         eff: f32,
-        large_non: ?std.ArrayList(Seg),
-        small_non: ?std.ArrayList(Seg),
+        large_cuts: ?std.ArrayList(Seg),
+        small_cuts: ?std.ArrayList(Seg),
     };
 
     fn pickDim(dc: *?DimCut, cut_infos: []const CutInfo, dim: u8) void {
@@ -616,10 +712,10 @@ const ParaTree = struct {
 
         for (0.., cut_infos) |i, *ci| {
             if (i != idx) {
-                if (ci.large_non) |a| {
+                if (ci.large_cuts) |a| {
                     a.deinit();
                 }
-                if (ci.small_non) |a| {
+                if (ci.small_cuts) |a| {
                     a.deinit();
                 }
             }
@@ -627,13 +723,13 @@ const ParaTree = struct {
 
         if (((dc.* != null) and (min < dc.*.?.eff)) or dc.* == null) {
             dc.* = DimCut{.dim = dim, .cut = @enumFromInt(idx),
-                .large_non = cut_infos[idx].large_non,
-                .small_non = cut_infos[idx].small_non,
+                .large_cuts = cut_infos[idx].large_cuts,
+                .small_cuts = cut_infos[idx].small_cuts,
                 .eff = min};
         }
     }
 
-    fn choose(self: *ParaTree, dim_segs: *[Dim]std.ArrayList(Seg)) !DimCut {
+    fn choose(self: *ParaTree, dim_segs: *[Dim]std.ArrayList(Seg), dim_info: []const DimInfo) !DimCut {
         var i:u8 = 0;
         var dc: ?DimCut = null;
 
@@ -644,13 +740,13 @@ const ParaTree = struct {
             }
             getUniq(Seg).uniq(&dim_segs[i], false);
             print("dim {}\n", .{i});
-            const cut_infos = try vectorizedCut(&dim_segs[i]);
+            const cut_infos = try vectorizedCut(&dim_segs[i], &dim_info[i]);
             pickDim(&dc, &cut_infos, i);
         }
         return dc.?;
     }
 
-    fn build(self: *ParaTree) !void {
+    fn build(self: *ParaTree, dim_info:[]const DimInfo) !void {
         var dim_segs : [Dim]std.ArrayList(Seg) = undefined;
         defer {
             var i:usize = 0;
@@ -659,9 +755,13 @@ const ParaTree = struct {
             }
         }
 
-        const dim = try choose(self, &dim_segs);
+        const dim = try choose(self, &dim_segs, dim_info);
         _ = dim;
     }
+};
+
+const DimInfo = struct {
+    size: u32,
 };
 
 fn paraCut(rule_list : *std.ArrayList(Rule)) !ParaTree {
@@ -672,7 +772,13 @@ fn paraCut(rule_list : *std.ArrayList(Rule)) !ParaTree {
         try tree.root.rules.append(r);
     }
 
-    try tree.build();
+    const dim_info = [_]DimInfo{ .{ .size = std.math.maxInt(u32)},
+                                 .{ .size = std.math.maxInt(u32)},
+                                 .{ .size = std.math.maxInt(u16)},
+                                 .{ .size = std.math.maxInt(u16)},
+                                 .{ .size = std.math.maxInt(u8)} };
+
+    try tree.build(&dim_info);
     return tree;
 }
 
