@@ -584,6 +584,8 @@ const ParaNode = struct {
 
         const trunc_size = truncateSize(T, size);
 
+        //FIXME: we do not consider nLargeCuts == 0, if equals to 0, the below code is not correct.
+        std.debug.assert(nLargeCuts > 0);
         for (segs.items) |seg| {
             const r = truncateRange(T, &seg.range, size);
             if (r.isLarge(trunc_size)) {
@@ -833,7 +835,7 @@ const ParaNode = struct {
     fn fromDimCut(self: *ParaNode, dc: *const DimCut) !void {
         const large_len:u5 = if (dc.large_cuts) |l| @truncate(l.items.len) else 0;
         const small_len:u5 = if (dc.small_cuts) |s| @truncate(s.items.len) else 0;
-        print("allocate {} nodes, large {} small {}\n", .{ large_len + small_len, large_len, small_len });
+        //print("allocate {} nodes, large {} small {}\n", .{ large_len + small_len, large_len, small_len });
 
         self.next = try allocator.alloc(ParaNode, large_len + small_len);
         self.dim = dc.dim;
@@ -866,7 +868,11 @@ const ParaNode = struct {
         try self.fromDimCut(dc);
 
         const large_offset = if (dc.small_cuts) |s| s.items.len else 0;
+
+        //NOTE: if nLargeCuts == 0, we do not need to seprate ranges into
+        //large/small size, just push it down to child nodes.
         std.debug.assert(nLargeCuts > 0);
+
         const trunc_size = truncFromTag(di.size, dc.cut);
         for (self.rules.items) |rule| {
             const range = &rule.ranges[dc.dim];
