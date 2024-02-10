@@ -947,19 +947,31 @@ pub fn main() !void {
     const file = try fs.cwd().openFile("fw1K", .{});
     defer file.close();
 
-    const rdr = file.reader();
+    var buf_reader = std.io.bufferedReader(file.reader());
+    const reader = buf_reader.reader();
+
     var line_no:u32 = 0;
     var rule_list = std.ArrayList(Rule).init(allocator);
     defer rule_list.deinit();
 
-    while (try rdr.readUntilDelimiterOrEofAlloc(allocator, '\n', 4096)) |line| {
-        defer allocator.free(line);
-        if (line[0] != '@') {
+    var line = std.ArrayList(u8).init(allocator);
+    defer line.deinit();
+
+    const writer = line.writer();
+
+    while (reader.streamUntilDelimiter(writer, '\n', null)) {
+        // Clear the line so we can reuse it.
+        defer line.clearRetainingCapacity();
+
+        if (line.items[0] != '@') {
             continue;
         }
-        const rule = try parseRule(line, line_no);
+        const rule = try parseRule(line.items, line_no);
         try rule_list.append(rule);
         line_no += 1;
+    } else |err| switch (err) {
+        error.EndOfStream => {}, // Continue on
+        else => return err, // Propagate error
     }
 
     _  = try paraCut(&rule_list);
