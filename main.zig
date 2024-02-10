@@ -616,14 +616,14 @@ const ParaNode = struct {
 
         if (n_large_cuts != 0) {
             large = try searchCuts(&large_segs, n_large_cuts, n_large);
-            dumpSegs(&large.?, "large cut");
+            //dumpSegs(&large.?, "large cut");
             const large_ratio = @as(f32, @floatFromInt(n_large)) / @as(f32, @floatFromInt(n_large + n_small));
             eff += calAverageWeight(&large.?) * large_ratio;
         }
 
         if (n_small_cuts != 0) {
             small = try searchCuts(&small_segs,  n_small_cuts, n_small);
-            dumpSegs(&small.?, "small cut");
+            //dumpSegs(&small.?, "small cut");
             const small_ratio = @as(f32, @floatFromInt(n_small)) / @as(f32, @floatFromInt(n_large + n_small));
             eff += calAverageWeight(&small.?) * small_ratio;
         }
@@ -659,9 +659,9 @@ const ParaNode = struct {
         while (idx < cut_kinds) : (idx += 1) {
             const cut:CutTag = @enumFromInt(idx);
             switch (cut) {
-                .u8x16 => cut_info[idx] = try cutDim(u8, segs, dim_info.size, nCuts[idx]),
-                .u16x8 => cut_info[idx] = try cutDim(u16, segs, dim_info.size, nCuts[idx]),
-                .u32x4 => cut_info[idx] = try cutDim(u32, segs, dim_info.size, nCuts[idx]),
+                .u8x16 => cut_info[idx] = try cutDim(u8, segs, dim_info.size(), nCuts[idx]),
+                .u16x8 => cut_info[idx] = try cutDim(u16, segs, dim_info.size(), nCuts[idx]),
+                .u32x4 => cut_info[idx] = try cutDim(u32, segs, dim_info.size(), nCuts[idx]),
             }
         }
         //for (0 .. cut_kinds) |i| {
@@ -748,11 +748,11 @@ const ParaNode = struct {
                 try dim_segs[i].append(Seg{ .range = r.ranges[i] });
             }
             getUniq(Seg).uniq(&dim_segs[i], false);
-            print("dim {}\n", .{i});
+            //print("dim {}\n", .{i});
             const cut_infos = try vectorizedCut(&dim_segs[i], &dim_info[i]);
             pickCut(&dc, &cut_infos, i);
         }
-        print("pick {} {} {d:.2}\n", .{dc.?.dim, dc.?.cut, dc.?.eff});
+        //print("pick {} {} {d:.2}\n", .{dc.?.dim, dc.?.cut, dc.?.eff});
         return dc.?;
     }
 
@@ -873,10 +873,10 @@ const ParaNode = struct {
         //large/small size, just push it down to child nodes.
         std.debug.assert(nLargeCuts > 0);
 
-        const trunc_size = truncFromTag(di.size, dc.cut);
+        const trunc_size = truncFromTag(di.size(), dc.cut);
         for (self.rules.items) |rule| {
             const range = &rule.ranges[dc.dim];
-            const r = truncRangeFromTag(dc.cut, di.size, range);
+            const r = truncRangeFromTag(dc.cut, di.size(), range);
 
             if (!r.isLarge(trunc_size)) {
                 for (0 .. , dc.small_cuts.?.items) |idx, cut_seg| {
@@ -894,8 +894,8 @@ const ParaNode = struct {
         }
         dc.clear();
         self.rules.clearAndFree();
-        self.dump();
-        self.dumpChildRules(false);
+        //self.dump();
+        //self.dumpChildRules(false);
     }
 
     fn dump(self: *ParaNode) void {
@@ -916,7 +916,11 @@ const ParaTree = struct {
 };
 
 const DimInfo = struct {
-    size: u32,
+    r : Range,
+
+    fn size(self: *const DimInfo) u32 {
+        return self.r.hi - self.r.lo +| 1;
+    }
 };
 
 fn paraCut(rule_list : *std.ArrayList(Rule)) !ParaTree {
@@ -927,11 +931,11 @@ fn paraCut(rule_list : *std.ArrayList(Rule)) !ParaTree {
         try tree.root.rules.append(r);
     }
 
-    const dim_info = [_]DimInfo{ .{ .size = std.math.maxInt(u32)},
-                                 .{ .size = std.math.maxInt(u32)},
-                                 .{ .size = std.math.maxInt(u16)},
-                                 .{ .size = std.math.maxInt(u16)},
-                                 .{ .size = std.math.maxInt(u8)} };
+    const dim_info = [_]DimInfo{ .{ .r = .{.lo = 0, .hi = std.math.maxInt(u32)}},
+                                 .{ .r = .{.lo = 0, .hi = std.math.maxInt(u32)}},
+                                 .{ .r = .{.lo = 0, .hi = std.math.maxInt(u16)}},
+                                 .{ .r = .{.lo = 0, .hi = std.math.maxInt(u16)}},
+                                 .{ .r = .{.lo = 0, .hi = std.math.maxInt(u8)}} };
 
     try tree.build(&dim_info);
     return tree;
