@@ -122,7 +122,7 @@ test {
     try expect(r1.hi == 0x11);
 }
 
-fn truncateRange(comptime T: type, r: Range, size: u32) Range {
+fn truncateRange(comptime T: type, r: *const Range, size: u32) Range {
     if (std.math.maxInt(T) >= size) {
         return Range {
             .lo = r.lo,
@@ -585,7 +585,7 @@ const ParaNode = struct {
         const trunc_size = truncateSize(T, size);
 
         for (segs.items) |seg| {
-            const r = truncateRange(T, seg.range, size);
+            const r = truncateRange(T, &seg.range, size);
             if (r.isLarge(trunc_size)) {
                 try large_segs.append(Seg{.range = .{.lo = r.lo, .hi = r.hi}, .weight = seg.weight});
                 n_large += seg.weight;
@@ -614,14 +614,14 @@ const ParaNode = struct {
 
         if (n_large_cuts != 0) {
             large = try searchCuts(&large_segs, n_large_cuts, n_large);
-            //dumpSegs(&large.?, "large cut");
+            dumpSegs(&large.?, "large cut");
             const large_ratio = @as(f32, @floatFromInt(n_large)) / @as(f32, @floatFromInt(n_large + n_small));
             eff += calAverageWeight(&large.?) * large_ratio;
         }
 
         if (n_small_cuts != 0) {
             small = try searchCuts(&small_segs,  n_small_cuts, n_small);
-            //dumpSegs(&small.?, "small cut");
+            dumpSegs(&small.?, "small cut");
             const small_ratio = @as(f32, @floatFromInt(n_small)) / @as(f32, @floatFromInt(n_large + n_small));
             eff += calAverageWeight(&small.?) * small_ratio;
         }
@@ -754,9 +754,12 @@ const ParaNode = struct {
         return dc.?;
     }
 
-    fn dumpChildRules(self: *ParaNode) void {
+    fn dumpChildRules(self: *ParaNode, verbose: bool) void {
         for (0 .., self.next) |idx, *n| {
-            print("The {} node:\n", .{idx});
+            print("The {} node: {}\n", .{idx, n.rules.items.len});
+            if (!verbose)
+                continue;
+
             for (n.rules.items) |r| {
                 print("{}\n", .{r.*});
             }
@@ -843,23 +846,41 @@ const ParaNode = struct {
         loadVector(&self.cuts, dc.cut, dc.large_cuts, dc.small_cuts);
     }
 
+    fn truncFromTag(size: u32, tag: CutTag) u32 {
+        switch (tag) {
+            .u8x16 => return truncateSize(u8, size),
+            .u16x8 => return truncateSize(u16, size),
+            .u32x4 => return truncateSize(u32, size),
+        }
+    }
+
+    fn truncRangeFromTag(tag: CutTag, size: u32, r: *const Range) Range {
+        switch (tag) {
+            .u8x16 => return truncateRange(u8,  r, size),
+            .u16x8 => return truncateRange(u16, r, size),
+            .u32x4 => return truncateRange(u32, r, size),
+        }
+    }
+
     fn pushRules(self: *ParaNode, dc: *DimCut, di: *const DimInfo) !void {
         try self.fromDimCut(dc);
 
         const large_offset = if (dc.small_cuts) |s| s.items.len else 0;
         std.debug.assert(nLargeCuts > 0);
+        const trunc_size = truncFromTag(di.size, dc.cut);
         for (self.rules.items) |rule| {
             const range = &rule.ranges[dc.dim];
+            const r = truncRangeFromTag(dc.cut, di.size, range);
 
-            if (!range.isLarge(di.size)) {
+            if (!r.isLarge(trunc_size)) {
                 for (0 .. , dc.small_cuts.?.items) |idx, cut_seg| {
-                    if (cut_seg.range.overlap(range)) {
+                    if (cut_seg.range.overlap(&r)) {
                         try self.next[idx].rules.append(rule);
                     }
                 }
             } else {
                 for (0 .., dc.large_cuts.?.items) |idx, cut_seg| {
-                    if (cut_seg.range.overlap(range)) {
+                    if (cut_seg.range.overlap(&r)) {
                         try self.next[large_offset + idx].rules.append(rule);
                     }
                 }
@@ -868,7 +889,7 @@ const ParaNode = struct {
         dc.clear();
         self.rules.clearAndFree();
         self.dump();
-        self.dumpChildRules();
+        self.dumpChildRules(false);
     }
 
     fn dump(self: *ParaNode) void {
