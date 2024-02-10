@@ -180,6 +180,10 @@ const ParaCuts = union(CutTag) {
     u32x4: struct {
         cuts: @Vector(4, u32),
     },
+
+    fn dump(self:*ParaCuts) void {
+        print("{}\n", .{self.*});
+    }
 };
 
 const Seg = struct {
@@ -338,10 +342,9 @@ const NextCut = struct {
 };
 
 const ParaNode = struct {
-    dim : u8,
-    small_mask: u16,
+    dim : u8 = 255,
+    flags: u32,
     cuts : ParaCuts,
-    cube: [Dim]Range,
     next: []ParaNode,
     rules: std.ArrayList(*Rule),
 
@@ -611,14 +614,14 @@ const ParaNode = struct {
 
         if (n_large_cuts != 0) {
             large = try searchCuts(&large_segs, n_large_cuts, n_large);
-            dumpSegs(&large.?, "large cut");
+            //dumpSegs(&large.?, "large cut");
             const large_ratio = @as(f32, @floatFromInt(n_large)) / @as(f32, @floatFromInt(n_large + n_small));
             eff += calAverageWeight(&large.?) * large_ratio;
         }
 
         if (n_small_cuts != 0) {
             small = try searchCuts(&small_segs,  n_small_cuts, n_small);
-            dumpSegs(&small.?, "small cut");
+            //dumpSegs(&small.?, "small cut");
             const small_ratio = @as(f32, @floatFromInt(n_small)) / @as(f32, @floatFromInt(n_large + n_small));
             eff += calAverageWeight(&small.?) * small_ratio;
         }
@@ -691,6 +694,16 @@ const ParaNode = struct {
         eff: f32,
         large_cuts: ?std.ArrayList(Seg),
         small_cuts: ?std.ArrayList(Seg),
+
+        fn clear(self: *DimCut) void {
+            if (self.large_cuts) |l| {
+                l.deinit();
+            }
+
+            if (self.small_cuts) |s| {
+                s.deinit();
+            }
+        }
     };
 
     fn pickCut(dc: *?DimCut, cut_infos: []const CutInfo, dim: u8) void {
@@ -733,12 +746,21 @@ const ParaNode = struct {
                 try dim_segs[i].append(Seg{ .range = r.ranges[i] });
             }
             getUniq(Seg).uniq(&dim_segs[i], false);
-            //print("dim {}\n", .{i});
+            print("dim {}\n", .{i});
             const cut_infos = try vectorizedCut(&dim_segs[i], &dim_info[i]);
             pickCut(&dc, &cut_infos, i);
         }
         print("pick {} {} {d:.2}\n", .{dc.?.dim, dc.?.cut, dc.?.eff});
         return dc.?;
+    }
+
+    fn dumpChildRules(self: *ParaNode) void {
+        for (0 .., self.next) |idx, *n| {
+            print("The {} node:\n", .{idx});
+            for (n.rules.items) |r| {
+                print("{}\n", .{r.*});
+            }
+        }
     }
 
     fn build(self: *ParaNode, dim_info:[]const DimInfo) !void {
@@ -749,24 +771,112 @@ const ParaNode = struct {
                 dim_segs[i].deinit();
             }
         }
-        const dc = try choose(self, &dim_segs, dim_info);
-        //self.pushRules(&dc, &dim_info[dc.dim]);
-        _ = dc;
+
+        var dc = try choose(self, &dim_segs, dim_info);
+        try self.pushRules(&dc, &dim_info[dc.dim]);
     }
 
-    fn pushRules(self: *ParaNode, dc: *const DimCut, di: *const DimInfo) void {
-        //for (self.rules.items) |rule| {
-        //    const range = &rule.ranges[dc.dim];
-        //    if (!range.isLarge(di.size)) {
-        //        for (dc.small_cuts.items) |cut_seg| {
-        //            if (cut_seg.range.overlap(range)) {
-        //            }
-        //        }
-        //    }
-        //}
-        _ = self;
-        _ = dc;
-        _ = di;
+    const zu8x16: @Vector(16, u8) = [_]u8{0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
+    const zu16x8: @Vector(8, u16) = [_]u16{0,0,0,0,0,0,0,0};
+    const zu32x4: @Vector(4, u32) = [_]u32{0,0,0,0};
+
+    fn loadVector(cuts: *ParaCuts, tag: CutTag, large_cuts: ?std.ArrayList(Seg),
+                  small_cuts: ?std.ArrayList(Seg)) void {
+        const offset = if (small_cuts) |s| s.items.len else 0;
+        switch (tag) {
+            .u8x16 => {
+                cuts.* = ParaCuts{ .u8x16 = .{ .cuts = zu8x16}};
+                if (small_cuts) |s| {
+                    for (0 .. s.items.len - 1) |i| {
+                        cuts.u8x16.cuts[i] = @truncate(s.items[i+1].range.lo);
+                    }
+                }
+                if (large_cuts) |l| {
+                    for (0 .. l.items.len - 1) |i| {
+                        cuts.u8x16.cuts[i + offset] = @truncate(l.items[i+1].range.lo);
+                    }
+                }
+            },
+            .u16x8 => {
+                cuts.* = ParaCuts{ .u16x8 = .{ .cuts = zu16x8}};
+                if (small_cuts) |s| {
+                    for (0 .. s.items.len - 1) |i| {
+                        cuts.u16x8.cuts[i] = @truncate(s.items[i+1].range.lo);
+                    }
+                }
+                if (large_cuts) |l| {
+                    for (0 .. l.items.len - 1) |i| {
+                        cuts.u16x8.cuts[i + offset] = @truncate(l.items[i+1].range.lo);
+                    }
+                }
+            },
+            .u32x4 => {
+                cuts.* = ParaCuts{ .u32x4 = .{ .cuts = zu32x4}};
+                if (small_cuts) |s| {
+                    for (0 .. s.items.len - 1) |i| {
+                        cuts.u32x4.cuts[i] = @truncate(s.items[i+1].range.lo);
+                    }
+                }
+                if (large_cuts) |l| {
+                    for (0 .. l.items.len - 1) |i| {
+                        cuts.u32x4.cuts[i + offset] = @truncate(l.items[i+1].range.lo);
+                    }
+                }
+            },
+        }
+    }
+
+    const LARGE_CUTS:u32 = 1 << 31;
+    fn fromDimCut(self: *ParaNode, dc: *const DimCut) !void {
+        const large_len:u5 = if (dc.large_cuts) |l| @truncate(l.items.len) else 0;
+        const small_len:u5 = if (dc.small_cuts) |s| @truncate(s.items.len) else 0;
+        print("allocate {} nodes, large {} small {}\n", .{ large_len + small_len, large_len, small_len });
+
+        self.next = try allocator.alloc(ParaNode, large_len + small_len);
+        self.dim = dc.dim;
+        for (self.next) |*n| {
+            n.rules = std.ArrayList(*Rule).init(allocator);
+        }
+
+        self.flags = (@as(u32, 1) << (small_len - 1)) - 1;
+        self.flags = if (large_len != 0) (self.flags | LARGE_CUTS) else self.flags;
+        loadVector(&self.cuts, dc.cut, dc.large_cuts, dc.small_cuts);
+    }
+
+    fn pushRules(self: *ParaNode, dc: *DimCut, di: *const DimInfo) !void {
+        try self.fromDimCut(dc);
+
+        const large_offset = if (dc.small_cuts) |s| s.items.len else 0;
+        std.debug.assert(nLargeCuts > 0);
+        for (self.rules.items) |rule| {
+            const range = &rule.ranges[dc.dim];
+
+            if (!range.isLarge(di.size)) {
+                for (0 .. , dc.small_cuts.?.items) |idx, cut_seg| {
+                    if (cut_seg.range.overlap(range)) {
+                        try self.next[idx].rules.append(rule);
+                    }
+                }
+            } else {
+                for (0 .., dc.large_cuts.?.items) |idx, cut_seg| {
+                    if (cut_seg.range.overlap(range)) {
+                        try self.next[large_offset + idx].rules.append(rule);
+                    }
+                }
+            }
+        }
+        dc.clear();
+        self.rules.clearAndFree();
+        self.dump();
+        self.dumpChildRules();
+    }
+
+    fn dump(self: *ParaNode) void {
+        print("dim {}\n", .{self.dim});
+        print("flags {x}\n", .{self.flags});
+        self.cuts.dump();
+        print("next {}\n", .{self.next.len});
+        print("rules {}\n", .{self.rules.items.len});
     }
 };
 
