@@ -3,6 +3,7 @@ const fs = std.fs;
 const print = std.debug.print;
 const net = std.net;
 const expect = std.testing.expect;
+const Error = std.mem.Allocator.Error;
 
 var gpa = std.heap.GeneralPurposeAllocator(.{.safety = false}){};
 const allocator = gpa.allocator();
@@ -284,7 +285,7 @@ const NextCut = struct {
         self.h.deinit();
     }
 
-    fn doCut(self: *NextCut, segs: *const std.ArrayList(Seg)) !void {
+    fn doCut(self: *NextCut, segs: *const std.ArrayList(Seg)) Error!void {
         while(self.h.peek()) |top| {
             if (top.v < self.cut.lo) {
                 const w = self.h.remove();
@@ -325,7 +326,7 @@ const NextCut = struct {
     }
 
     fn searchCut(self: *NextCut, segs: *const std.ArrayList(Seg),
-        non: *const std.ArrayList(Seg), t: f32, last_cut: bool) !void {
+        non: *const std.ArrayList(Seg), t: f32, last_cut: bool) Error!void {
         self.nextCutLo(non);
 
         while (true) {
@@ -355,7 +356,7 @@ const ParaNode = struct {
 
     const PQlt = std.PriorityQueue(u32, void, lessThan);
 
-    fn genNonOverlappedSegs(seg_list: *const std.ArrayList(Seg)) !std.ArrayList(Seg) {
+    fn genNonOverlappedSegs(seg_list: *const std.ArrayList(Seg)) Error!std.ArrayList(Seg) {
         var list = std.ArrayList(Seg).init(allocator);
         var h = PQlt.init(allocator, {});
         defer h.deinit();
@@ -535,7 +536,7 @@ const ParaNode = struct {
         }
     }
 
-    fn searchCuts(segs: *std.ArrayList(Seg), n_cuts: u8, n_rules: usize) !std.ArrayList(Seg) {
+    fn searchCuts(segs: *std.ArrayList(Seg), n_cuts: u8, n_rules: usize) Error!std.ArrayList(Seg) {
         getUniq(Seg).uniq(segs, true);
         //dumpSegs(segs, "uniq");
         const non = try genNonOverlappedSegs(segs);
@@ -574,7 +575,7 @@ const ParaNode = struct {
         return @min(size, std.math.maxInt(T));
     }
 
-    fn cutDim(comptime T:type, segs: *const std.ArrayList(Seg), size: u32, n_cuts: u8) !CutInfo {
+    fn cutDim(comptime T:type, segs: *const std.ArrayList(Seg), size: u32, n_cuts: u8) Error!CutInfo {
         var large_segs = std.ArrayList(Seg).init(allocator);
         defer large_segs.deinit();
         var small_segs = std.ArrayList(Seg).init(allocator);
@@ -652,7 +653,7 @@ const ParaNode = struct {
 
     const nCuts = [_]u8{ 16, 8, 4};
     const cut_kinds = @typeInfo(CutTag).Enum.fields.len;
-    fn vectorizedCut(segs: *const std.ArrayList(Seg), dim_info:*const DimInfo) ![cut_kinds]CutInfo {
+    fn vectorizedCut(segs: *const std.ArrayList(Seg), dim_info:*const DimInfo) Error![cut_kinds]CutInfo {
         var idx:usize = 0;
         var cut_info:[cut_kinds]CutInfo = undefined;
 
@@ -738,12 +739,11 @@ const ParaNode = struct {
         }
     }
 
-    fn choose(self: *ParaNode, dim_segs: *[Dim]std.ArrayList(Seg), dim_info: []const DimInfo) !DimCut {
+    fn choose(self: *ParaNode, dim_segs: *[Dim]std.ArrayList(Seg), dim_info: []const DimInfo) Error!DimCut {
         var i:u8 = 0;
         var dc: ?DimCut = null;
 
         while (i < Dim) : (i += 1) {
-            dim_segs[i] = std.ArrayList(Seg).init(allocator);
             for (self.rules.items) |r| {
                 try dim_segs[i].append(Seg{ .range = r.ranges[i] });
             }
@@ -768,7 +768,8 @@ const ParaNode = struct {
         }
     }
 
-    fn build(self: *ParaNode, dim_info:[]const DimInfo) !void {
+    const binRules = 100;
+    fn build(self: *ParaNode, dim_info:[]DimInfo) Error!void {
         var dim_segs : [Dim]std.ArrayList(Seg) = undefined;
         defer {
             var i:usize = 0;
@@ -777,8 +778,16 @@ const ParaNode = struct {
             }
         }
 
+        for (0..Dim) |i| {
+            dim_segs[i] = std.ArrayList(Seg).init(allocator);
+        }
+
+        if (self.rules.items.len < binRules) {
+            return;
+        }
+
         var dc = try choose(self, &dim_segs, dim_info);
-        try self.pushRules(&dc, &dim_info[dc.dim]);
+        try self.pushRules(&dc, dim_info);
     }
 
     const zu8x16: @Vector(16, u8) = [_]u8{0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
@@ -864,8 +873,9 @@ const ParaNode = struct {
         }
     }
 
-    fn pushRules(self: *ParaNode, dc: *DimCut, di: *const DimInfo) !void {
+    fn pushRules(self: *ParaNode, dc: *DimCut, cube: []DimInfo) Error!void {
         try self.fromDimCut(dc);
+        const di = &cube[dc.dim];
 
         const large_offset = if (dc.small_cuts) |s| s.items.len else 0;
 
@@ -892,8 +902,25 @@ const ParaNode = struct {
                 }
             }
         }
-        dc.clear();
-        self.rules.clearAndFree();
+
+        const parent_range = cube[dc.dim].r;
+        if (dc.small_cuts) |s| {
+            for (0 .., s.items) |idx, seg| {
+                cube[dc.dim].r = seg.range;
+                try self.next[idx].build(cube);
+            }
+        }
+
+        if (dc.large_cuts) |l| {
+            for (0 .., l.items) |idx, seg| {
+                cube[dc.dim].r = seg.range;
+                try self.next[large_offset + idx].build(cube);
+            }
+        }
+        cube[dc.dim].r = parent_range;
+
+        defer dc.clear();
+        defer self.rules.clearAndFree();
         //self.dump();
         //self.dumpChildRules(false);
     }
@@ -905,13 +932,24 @@ const ParaNode = struct {
         print("next {}\n", .{self.next.len});
         print("rules {}\n", .{self.rules.items.len});
     }
+
+    fn deinit(self: *ParaNode) void {
+        for (self.next) |*n| {
+            n.deinit();
+        }
+        allocator.free(self.next);
+    }
 };
 
 const ParaTree = struct {
     root: ParaNode,
 
-    fn build(self: *ParaTree, dim_info:[]const DimInfo) !void {
+    fn build(self: *ParaTree, dim_info:[]DimInfo) !void {
         try self.root.build(dim_info);
+    }
+
+    fn deinit(self: *ParaTree) void {
+        self.root.deinit();
     }
 };
 
@@ -931,11 +969,11 @@ fn paraCut(rule_list : *std.ArrayList(Rule)) !ParaTree {
         try tree.root.rules.append(r);
     }
 
-    const dim_info = [_]DimInfo{ .{ .r = .{.lo = 0, .hi = std.math.maxInt(u32)}},
-                                 .{ .r = .{.lo = 0, .hi = std.math.maxInt(u32)}},
-                                 .{ .r = .{.lo = 0, .hi = std.math.maxInt(u16)}},
-                                 .{ .r = .{.lo = 0, .hi = std.math.maxInt(u16)}},
-                                 .{ .r = .{.lo = 0, .hi = std.math.maxInt(u8)}} };
+    var dim_info = [_]DimInfo{ .{ .r = .{.lo = 0, .hi = std.math.maxInt(u32)}},
+                               .{ .r = .{.lo = 0, .hi = std.math.maxInt(u32)}},
+                               .{ .r = .{.lo = 0, .hi = std.math.maxInt(u16)}},
+                               .{ .r = .{.lo = 0, .hi = std.math.maxInt(u16)}},
+                               .{ .r = .{.lo = 0, .hi = std.math.maxInt(u8)}} };
 
     try tree.build(&dim_info);
     return tree;
@@ -974,6 +1012,7 @@ pub fn main() !void {
         else => return err, // Propagate error
     }
 
-    _  = try paraCut(&rule_list);
+    var t = try paraCut(&rule_list);
+    t.deinit();
 }
 
