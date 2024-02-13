@@ -349,16 +349,17 @@ const NextCut = struct {
 const ParaFlag = packed struct(u32) {
     large_cut : u1,
     trunc_flag: u1,
-    unused: u14 = 0,
+    unused: u14,
     small_mask: u16,
 };
 
 const ParaNode = struct {
-    dim : u8 = 255,
-    flags: ParaFlag,
-    cuts : ParaCuts,
-    next: []ParaNode,
-    rules: std.ArrayList(*Rule),
+    const LeafNode = 255;
+    dim : u8 = LeafNode,
+    flags: ParaFlag = undefined,
+    cuts : ParaCuts = undefined,
+    next: []ParaNode = undefined,
+    rules: std.ArrayList(*Rule) = std.ArrayList(*Rule).init(allocator),
 
     const Order = std.math.Order;
     fn lessThan(_ : void, a: u32, b: u32) Order {
@@ -375,7 +376,7 @@ const ParaNode = struct {
 
 
         var idx:usize = 1;
-        var curr:u32 = items[0].range.lo;
+        var curr:usize = items[0].range.lo;
         try h.add(items[0].range.hi);
 
         while (idx < items.len) : (idx += 1) {
@@ -384,11 +385,11 @@ const ParaNode = struct {
                 // We should be careful about the [A, A] (the hi and lo are equal) and [A, B].
                 // We need the results to be [A, A] and [A+1, B].
                 if (r.lo == curr and r.lo == r.hi) {
-                    try list.append(Seg{ .range = .{ .lo = curr, .hi = r.hi } });
+                    try list.append(Seg{ .range = .{ .lo = @truncate(curr), .hi = r.hi } });
                     curr = r.hi + 1;
                 } else {
                     if (curr < r.lo) {
-                        try list.append(Seg{ .range = .{ .lo = curr, .hi = r.lo - 1} });
+                        try list.append(Seg{ .range = .{ .lo = @truncate(curr), .hi = r.lo - 1} });
                         curr = r.lo;
                     }
                     try h.add(items[idx].range.hi);
@@ -401,7 +402,7 @@ const ParaNode = struct {
                         // we need a seg: [r.lo, top], as the current range r overlaps with a
                         // previous range (in the heap).
                         if (r.lo > curr) {
-                            try list.append(Seg{.range = .{.lo = curr, .hi = r.lo - 1}});
+                            try list.append(Seg{.range = .{.lo = @truncate(curr), .hi = r.lo - 1}});
                             curr = r.lo;
                         }
 
@@ -416,7 +417,7 @@ const ParaNode = struct {
                         // r.lo > top, and since there are values in heap, there are overlapped
                         // ranges.
                         if (curr <= top) {
-                            try list.append(Seg{.range = .{ .lo = curr, .hi = top} });
+                            try list.append(Seg{.range = .{ .lo = @truncate(curr), .hi = top} });
                             curr = top + 1;
                         }
                     } else {
@@ -435,8 +436,8 @@ const ParaNode = struct {
 
         while (h.peek()) |top| {
             if (curr <= top) {
-                try list.append(Seg{.range = .{ .lo = curr, .hi = top }});
-                curr = top +% 1;
+                try list.append(Seg{.range = .{ .lo = @truncate(curr), .hi = top }});
+                curr = @as(usize, @intCast(top)) + 1;
             }
             _ = h.remove();
         }
@@ -538,6 +539,15 @@ const ParaNode = struct {
         g.deinit();
         l.clearAndFree();
 
+        // [0, std.math.maxInt(u32)], [2, std.math.maxInt(u32)]
+        try l.append(Seg{ .range = .{ .lo = 0, .hi = std.math.maxInt(u32)}});
+        try l.append(Seg{ .range = .{ .lo = 2, .hi = std.math.maxInt(u32)}});
+        g = try genNonOverlappedSegs(&l);
+        try expect(g.items[0].eq(Seg{ .range = .{ .lo = 0, .hi = 1 }}));
+        try expect(g.items[1].eq(Seg{ .range = .{ .lo = 2, .hi = std.math.maxInt(u32) }}));
+        try expect(g.items.len == 2);
+        g.deinit();
+        l.clearAndFree();
     }
 
     fn dumpSegs(segs: *const std.ArrayList(Seg), desc: []const u8) void {
@@ -551,6 +561,7 @@ const ParaNode = struct {
         getUniq(Seg).uniq(segs, true);
         //dumpSegs(segs, "uniq");
         const non = try genNonOverlappedSegs(segs);
+        //dumpSegs(&non, "non");
 
         const t:f32 = @as(f32, @floatFromInt(n_rules)) / @as(f32, @floatFromInt(n_cuts + 1));
         //print("t {d:.2}\n", .{t});
@@ -629,14 +640,14 @@ const ParaNode = struct {
 
         if (n_large_cuts != 0) {
             large = try searchCuts(&large_segs, n_large_cuts, n_large);
-            //dumpSegs(&large.?, "large cut");
+            dumpSegs(&large.?, "large cut");
             const large_ratio = @as(f32, @floatFromInt(n_large)) / @as(f32, @floatFromInt(n_large + n_small));
             eff += calAverageWeight(&large.?) * large_ratio;
         }
 
         if (n_small_cuts != 0) {
             small = try searchCuts(&small_segs,  n_small_cuts, n_small);
-            //dumpSegs(&small.?, "small cut");
+            dumpSegs(&small.?, "small cut");
             const small_ratio = @as(f32, @floatFromInt(n_small)) / @as(f32, @floatFromInt(n_large + n_small));
             eff += calAverageWeight(&small.?) * small_ratio;
         }
@@ -690,7 +701,7 @@ const ParaNode = struct {
         defer segs.deinit();
         try segs.append(Seg{.range = .{.lo = 0, .hi = std.math.maxInt(u32)}, .weight = 10});
         try segs.append(Seg{.range = .{.lo = 0, .hi = 0}, .weight = 20});
-        const cut = try vectorizedCut(&segs, &DimInfo{.size = std.math.maxInt(u32)});
+        const cut = try vectorizedCut(&segs, &DimInfo{.r = .{.lo =0, .hi = std.math.maxInt(u32)}});
         try expect(cut[0].eff - 16.66666 < 0.00001);
         try expect(cut[1].eff - 16.66666 < 0.00001);
         try expect(cut[2].eff - 16.66666 < 0.00001);
@@ -781,22 +792,21 @@ const ParaNode = struct {
         }
     }
 
-    const binRules = 100;
+    const binRules = 8;
     fn build(self: *ParaNode, dim_info:[]const DimInfo) Error!void {
-        var dim_segs : [Dim]std.ArrayList(Seg) = undefined;
-        defer {
-            var i:usize = 0;
-            while (i < Dim) : (i += 1) {
-                dim_segs[i].deinit();
-            }
+        if (self.rules.items.len < binRules) {
+            return;
         }
 
+        var dim_segs : [Dim]std.ArrayList(Seg) = undefined;
         for (0..Dim) |i| {
             dim_segs[i] = std.ArrayList(Seg).init(allocator);
         }
 
-        if (self.rules.items.len < binRules) {
-            return;
+        defer {
+            for (&dim_segs) |seg| {
+                seg.deinit();
+            }
         }
 
         var dc = try choose(self, &dim_segs, dim_info);
@@ -874,6 +884,12 @@ const ParaNode = struct {
         }
     }
 
+    fn initChildNode(self: *ParaNode) void {
+        for (self.next) |*n| {
+            n.* = ParaNode{};
+        }
+    }
+
     fn fromDimCut(self: *ParaNode, dc: *const DimCut, di: *const DimInfo) !void {
         const large_len:u5 = if (dc.large_cuts) |l| @truncate(l.items.len) else 0;
         const small_len:u5 = if (dc.small_cuts) |s| @truncate(s.items.len) else 0;
@@ -881,13 +897,10 @@ const ParaNode = struct {
 
         self.next = try allocator.alloc(ParaNode, large_len + small_len);
         self.dim = dc.dim;
-        for (self.next) |*n| {
-            n.rules = std.ArrayList(*Rule).init(allocator);
-        }
-
         self.flags = ParaFlag{.small_mask = (@as(u16, 1) << @truncate(small_len - 1)) - 1,
                               .large_cut = if (large_len != 0) 1 else 0,
-                              .trunc_flag = truncFlag(dc, di)};
+                              .trunc_flag = truncFlag(dc, di), .unused = 0};
+        self.initChildNode();
         loadVector(&self.cuts, dc.cut, dc.large_cuts, dc.small_cuts);
     }
 
@@ -987,8 +1000,10 @@ const ParaNode = struct {
     }
 
     fn deinit(self: *ParaNode) void {
-        for (self.next) |*n| {
-            n.deinit();
+        if (self.dim != LeafNode) {
+            for (self.next) |*n| {
+                n.deinit();
+            }
         }
         allocator.free(self.next);
     }
@@ -1015,9 +1030,7 @@ const DimInfo = struct {
 };
 
 fn paraCut(rule_list : *std.ArrayList(Rule)) !ParaTree {
-    var tree: ParaTree = undefined;
-    tree.root.rules = std.ArrayList(*Rule).init(allocator);
-
+    var tree: ParaTree = .{ .root = .{}};
     for (rule_list.items) |*r| {
         try tree.root.rules.append(r);
     }
