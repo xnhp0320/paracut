@@ -640,14 +640,14 @@ const ParaNode = struct {
 
         if (n_large_cuts != 0) {
             large = try searchCuts(&large_segs, n_large_cuts, n_large);
-            dumpSegs(&large.?, "large cut");
+            //dumpSegs(&large.?, "large cut");
             const large_ratio = @as(f32, @floatFromInt(n_large)) / @as(f32, @floatFromInt(n_large + n_small));
             eff += calAverageWeight(&large.?) * large_ratio;
         }
 
         if (n_small_cuts != 0) {
             small = try searchCuts(&small_segs,  n_small_cuts, n_small);
-            dumpSegs(&small.?, "small cut");
+            //dumpSegs(&small.?, "small cut");
             const small_ratio = @as(f32, @floatFromInt(n_small)) / @as(f32, @floatFromInt(n_large + n_small));
             eff += calAverageWeight(&small.?) * small_ratio;
         }
@@ -776,7 +776,7 @@ const ParaNode = struct {
             const cut_infos = try vectorizedCut(&dim_segs[i], &dim_info[i]);
             pickCut(&dc, &cut_infos, i);
         }
-        print("pick {} {} {d:.2}\n", .{dc.?.dim, dc.?.cut, dc.?.eff});
+        //print("pick {} {} {d:.2}\n", .{dc.?.dim, dc.?.cut, dc.?.eff});
         return dc.?;
     }
 
@@ -987,8 +987,8 @@ const ParaNode = struct {
 
         defer dc.clear();
         defer self.rules.clearAndFree();
-        self.dump();
-        self.dumpChildRules(false);
+        //self.dump();
+        //self.dumpChildRules(false);
     }
 
     fn dump(self: *ParaNode) void {
