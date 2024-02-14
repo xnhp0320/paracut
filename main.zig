@@ -123,16 +123,25 @@ test {
     try expect(r1.hi == 0x11);
 }
 
-fn truncateRange(comptime T: type, r: *const Range, size: u32, dilo: u32) Range {
-    const lo = if (r.lo > dilo ) r.lo - dilo else 0;
-    const hi = r.hi - dilo;
+fn mapInto(r: *const Range, t: *const Range) Range {
+    const lo = @max(r.lo, t.lo);
+    const hi = @min(r.hi, t.hi);
+
+    return Range{ .lo = lo - t.lo,
+                  .hi = hi - t.lo };
+}
+
+fn truncateRange(comptime T: type, r: *const Range, size: u32, di: *const DimInfo) Range {
+    //print("trunc {} {}\n", .{r.*, di.r});
+    std.debug.assert(r.overlap(&di.r));
+    const range = mapInto(r, &di.r);
 
     if (std.math.maxInt(T) >= size) {
-        return Range {
-            .lo = lo,
-            .hi = hi
-        };
+        return range;
     }
+
+    const hi = range.hi;
+    const lo = range.lo;
 
     switch (T) {
         u32 => return Range {
@@ -351,11 +360,18 @@ const ParaFlag = packed struct(u32) {
     trunc_flag: u1,
     unused: u14,
     small_mask: u16,
+
+    fn dump(self: *ParaFlag) void {
+        print("Flag: large_cut {} trunc_flag: {} small_mask: 0x{x:02}\n",
+            .{self.large_cut, self.trunc_flag, self.small_mask});
+
+    }
 };
 
 const ParaNode = struct {
     const LeafNode = 255;
     dim : u8 = LeafNode,
+    offset: u32 = 0,
     flags: ParaFlag = undefined,
     cuts : ParaCuts = undefined,
     next: []ParaNode = undefined,
@@ -611,7 +627,7 @@ const ParaNode = struct {
         //FIXME: we do not consider nLargeCuts == 0, if equals to 0, the below code is not correct.
         std.debug.assert(nLargeCuts > 0);
         for (segs.items) |seg| {
-            const r = truncateRange(T, &seg.range, size, di.r.lo);
+            const r = truncateRange(T, &seg.range, size, di);
             if (r.isLarge(trunc_size)) {
                 try large_segs.append(Seg{.range = .{.lo = r.lo, .hi = r.hi}, .weight = seg.weight});
                 n_large += seg.weight;
@@ -669,9 +685,9 @@ const ParaNode = struct {
     }
 
     const CutInfo = struct {
-        large_cuts : ?std.ArrayList(Seg),
-        small_cuts : ?std.ArrayList(Seg),
-        eff: f32,
+        large_cuts : ?std.ArrayList(Seg) = null,
+        small_cuts : ?std.ArrayList(Seg) = null,
+        eff: f32 = std.math.floatMax(f32),
     };
 
 
@@ -679,9 +695,18 @@ const ParaNode = struct {
     const cut_kinds = @typeInfo(CutTag).Enum.fields.len;
     fn vectorizedCut(segs: *const std.ArrayList(Seg), dim_info:*const DimInfo) Error![cut_kinds]CutInfo {
         var idx:usize = 0;
-        var cut_info:[cut_kinds]CutInfo = undefined;
+        var cut_info = [_]CutInfo{.{}} ** cut_kinds;
+        var kinds:usize = undefined;
 
-        while (idx < cut_kinds) : (idx += 1) {
+        if (dim_info.size() > std.math.maxInt(u16)) {
+            kinds = 3;
+        } else if (dim_info.size() > std.math.maxInt(u8)) {
+            kinds = 2;
+        } else {
+            kinds = 1;
+        }
+
+        while (idx < kinds) : (idx += 1) {
             const cut:CutTag = @enumFromInt(idx);
             switch (cut) {
                 .u8x16 => cut_info[idx] = try cutDim(u8, segs, dim_info, nCuts[idx]),
@@ -772,6 +797,7 @@ const ParaNode = struct {
                 try dim_segs[i].append(Seg{ .range = r.ranges[i] });
             }
             getUniq(Seg).uniq(&dim_segs[i], false);
+            //dumpSegs(&dim_segs[i], "orignal");
             //print("dim {} {any}\n", .{i, dim_info});
             const cut_infos = try vectorizedCut(&dim_segs[i], &dim_info[i]);
             pickCut(&dc, &cut_infos, i);
@@ -781,6 +807,9 @@ const ParaNode = struct {
     }
 
     fn dumpChildRules(self: *ParaNode, verbose: bool) void {
+        if (self.dim == LeafNode)
+            return;
+
         for (0 .., self.next) |idx, *n| {
             print("The {} node: {}\n", .{idx, n.rules.items.len});
             if (!verbose)
@@ -891,15 +920,16 @@ const ParaNode = struct {
     }
 
     fn fromDimCut(self: *ParaNode, dc: *const DimCut, di: *const DimInfo) !void {
-        const large_len:u5 = if (dc.large_cuts) |l| @truncate(l.items.len) else 0;
-        const small_len:u5 = if (dc.small_cuts) |s| @truncate(s.items.len) else 0;
+        const large_len = if (dc.large_cuts) |l| l.items.len else 0;
+        const small_len = if (dc.small_cuts) |s| s.items.len else 0;
         //print("allocate {} nodes, large {} small {}\n", .{ large_len + small_len, large_len, small_len });
 
         self.next = try allocator.alloc(ParaNode, large_len + small_len);
         self.dim = dc.dim;
-        self.flags = ParaFlag{.small_mask = (@as(u16, 1) << @truncate(small_len - 1)) - 1,
+        self.flags = ParaFlag{.small_mask = if (small_len != 0) (@as(u16, 1) << @truncate(small_len - 1)) - 1 else 0,
                               .large_cut = if (large_len != 0) 1 else 0,
                               .trunc_flag = truncFlag(dc, di), .unused = 0};
+        self.offset = di.r.lo;
         self.initChildNode();
         loadVector(&self.cuts, dc.cut, dc.large_cuts, dc.small_cuts);
     }
@@ -912,11 +942,11 @@ const ParaNode = struct {
         }
     }
 
-    fn truncRangeFromTag(tag: CutTag, size: u32, lo :u32, r: *const Range) Range {
+    fn truncRangeFromTag(tag: CutTag, size: u32, di :*const DimInfo, r: *const Range) Range {
         switch (tag) {
-            .u8x16 => return truncateRange(u8,  r, size, lo),
-            .u16x8 => return truncateRange(u16, r, size, lo),
-            .u32x4 => return truncateRange(u32, r, size, lo),
+            .u8x16 => return truncateRange(u8,  r, size, di),
+            .u16x8 => return truncateRange(u16, r, size, di),
+            .u32x4 => return truncateRange(u32, r, size, di),
         }
     }
 
@@ -925,17 +955,19 @@ const ParaNode = struct {
         switch (tag) {
             .u8x16 => {
                 if (size > std.math.maxInt(u8)) {
-                    return .{ .lo = (r.lo << 24) + di.r.lo, .hi = (r.hi << 24) + di.r.lo };
+                    const hi = (r.hi << 24) + 0x00FFFFFF + di.r.lo;
+                    return .{ .lo = (r.lo << 24) + di.r.lo, .hi = hi };
                 }
             },
             .u16x8 => {
                 if (size > std.math.maxInt(u16)) {
-                    return .{ .lo = (r.lo << 16) + di.r.lo, .hi = (r.hi << 16) + di.r.lo};
+                    const hi = (r.hi << 16) + 0x0000FFFF + di.r.lo;
+                    return .{ .lo = (r.lo << 16) + di.r.lo, .hi = hi};
                 }
             },
-            .u32x4 => return r.*,
+            .u32x4 => return .{ .lo = r.lo + di.r.lo, .hi = r.hi + di.r.lo },
         }
-        return r.*;
+        return .{ .lo = r.lo + di.r.lo, .hi = r.hi + di.r.lo };
     }
 
     fn pushRules(self: *ParaNode, dc: *DimCut, cube: []const DimInfo) Error!void {
@@ -951,7 +983,7 @@ const ParaNode = struct {
         const trunc_size = truncFromTag(di.size(), dc.cut);
         for (self.rules.items) |rule| {
             const range = &rule.ranges[dc.dim];
-            const r = truncRangeFromTag(dc.cut, di.size(), di.r.lo, range);
+            const r = truncRangeFromTag(dc.cut, di.size(), di, range);
 
             if (!r.isLarge(trunc_size)) {
                 for (0 .. , dc.small_cuts.?.items) |idx, cut_seg| {
@@ -968,35 +1000,46 @@ const ParaNode = struct {
             }
         }
 
+        //self.dumpChildRules(true);
+
         var newcube = [_]DimInfo{undefined} ** Dim;
         @memcpy(&newcube, cube);
 
         if (dc.small_cuts) |s| {
             for (0 .., s.items) |idx, seg| {
                 newcube[dc.dim].r = expandRange(dc.cut, &seg.range, di);
-                try self.next[idx].build(cube);
+                try self.next[idx].build(&newcube);
             }
         }
 
         if (dc.large_cuts) |l| {
             for (0 .., l.items) |idx, seg| {
                 newcube[dc.dim].r = expandRange(dc.cut, &seg.range, di);
-                try self.next[large_offset + idx].build(cube);
+                try self.next[large_offset + idx].build(&newcube);
             }
         }
 
         defer dc.clear();
         defer self.rules.clearAndFree();
-        //self.dump();
-        //self.dumpChildRules(false);
     }
 
-    fn dump(self: *ParaNode) void {
+    fn dump(self: *ParaNode, verbose: bool) void {
+        if (self.dim == LeafNode) {
+            print("LeafNode\n", .{});
+            return;
+        }
+
         print("dim {}\n", .{self.dim});
-        print("flags {}\n", .{self.flags});
+        print("offset {}\n", .{self.offset});
+        self.flags.dump();
         self.cuts.dump();
         print("next {}\n", .{self.next.len});
         print("rules {}\n", .{self.rules.items.len});
+        if (verbose) {
+            for (self.rules.items) |r| {
+                print("{}\n", .{r.*});
+            }
+        }
     }
 
     fn deinit(self: *ParaNode) void {
@@ -1006,6 +1049,16 @@ const ParaNode = struct {
             }
         }
         allocator.free(self.next);
+    }
+
+    fn countLeaves(self: *const ParaNode, val: *usize) void {
+        if (self.dim == LeafNode) {
+            val.* += 1;
+        } else {
+            for (self.next) |*n| {
+                n.countLeaves(val);
+            }
+        }
     }
 };
 
@@ -1018,6 +1071,12 @@ const ParaTree = struct {
 
     fn deinit(self: *ParaTree) void {
         self.root.deinit();
+    }
+
+    fn countLeaves(self: *ParaTree) usize {
+        var leaves:usize = 0;
+        self.root.countLeaves(&leaves);
+        return leaves;
     }
 };
 
@@ -1079,6 +1138,7 @@ pub fn main() !void {
     }
 
     var t = try paraCut(&rule_list);
+    //print("{}\n", .{t.countLeaves()});
     t.deinit();
 }
 
