@@ -299,6 +299,20 @@ test {
     _ = ParaNode;
 }
 
+const SearchPolicy = union(enum) {
+    PreAverage: f32,
+    Average : struct {
+        n_rules: u32,
+        const Self = @This();
+
+        fn next_target(self: *Self, passed_rules: usize, n_cuts: u8) f32 {
+            const rules = self.n_rules - passed_rules;
+            const t = @as(f32, @floatFromInt(rules)) / @as(f32, @floatFromInt(n_cuts + 1));
+            return t;
+        }
+    },
+};
+
 const NextCut = struct {
     const W = struct {
         v : u32,
@@ -313,13 +327,16 @@ const NextCut = struct {
     const PQlt = std.PriorityQueue(W, void, lessThan);
 
     curr_rules: u32 = 0,
+    pass_rules: u32 = 0,
     cut: Range = undefined,
     seg_idx: usize = 0,
     start_idx: usize = 0,
     h: PQlt = undefined,
+    policy: SearchPolicy = undefined,
 
-    fn init(self: *NextCut) void {
+    fn init(self: *NextCut, policy: SearchPolicy) void {
         self.h = PQlt.init(allocator, {});
+        self.policy = policy;
     }
 
     fn deinit(self: *NextCut) void {
@@ -340,6 +357,7 @@ const NextCut = struct {
             const seg = &segs.items[self.seg_idx];
             if (seg.range.lo <= self.cut.hi) {
                 self.curr_rules += seg.weight;
+                self.pass_rules += seg.weight;
                 try self.h.add(W{.v = seg.range.hi, .w = seg.weight});
             } else {
                 break;
@@ -368,18 +386,21 @@ const NextCut = struct {
     }
 
     fn searchCut(self: *NextCut, segs: *const std.ArrayList(Seg),
-        non: *const std.ArrayList(Seg), t: f32, last_cut: bool) Error!void {
+        non: *const std.ArrayList(Seg), n_cuts:u8, last_cut: bool) Error!void {
         self.nextCutLo(non);
+        const t:f32 = switch (self.policy) {
+            .PreAverage => self.policy.PreAverage,
+            .Average => self.policy.Average.next_target(self.pass_rules, n_cuts),
+        };
 
         while (true) {
-           self.nextCutHi(non, last_cut);
-           try self.doCut(segs);
-           //print("cuts {} {} {}\n", .{self.curr_rules, self.cut, self.start_idx});
-
-           if (@as(f32, @floatFromInt(self.curr_rules)) >= t
-               or !self.hasNext(non)) {
-               break;
-           }
+            self.nextCutHi(non, last_cut);
+            try self.doCut(segs);
+            //print("cuts {} {} {}\n", .{self.curr_rules, self.cut, self.start_idx});
+            if (@as(f32, @floatFromInt(self.curr_rules)) >= t
+                or !self.hasNext(non)) {
+                break;
+            }
         }
     }
 };
@@ -609,25 +630,26 @@ const ParaNode = struct {
         }
     }
 
-    fn searchCuts(segs: *std.ArrayList(Seg), n_cuts: u8, n_rules: usize) Error!std.ArrayList(Seg) {
+    fn searchCuts(segs: *std.ArrayList(Seg), n_cuts: u8, n_rules: u32) Error!std.ArrayList(Seg) {
         getUniq(Seg).uniq(segs, true);
         //dumpSegs(segs, "uniq");
         const non = try genNonOverlappedSegs(segs);
         defer non.deinit();
         //dumpSegs(&non, "non");
 
-        const t:f32 = @as(f32, @floatFromInt(n_rules)) / @as(f32, @floatFromInt(n_cuts + 1));
         //print("t {d:.2}\n", .{t});
         var i:usize = 0;
+        const policy:SearchPolicy = .{ .PreAverage = @as(f32, @floatFromInt(n_rules)) / @as(f32, @floatFromInt(n_cuts + 1)) };
+        //const policy:SearchPolicy = .{ .Average = .{ .n_rules = n_rules }};
 
         var nextcut = NextCut{};
-        nextcut.init();
+        nextcut.init(policy);
         defer nextcut.deinit();
 
         var cut_segs = std.ArrayList(Seg).init(allocator);
 
         while (i < n_cuts + 1 and nextcut.hasNext(&non)) : (i += 1) {
-            try nextcut.searchCut(segs, &non, t, i == n_cuts);
+            try nextcut.searchCut(segs, &non, @truncate(n_cuts - i), i == n_cuts);
             try cut_segs.append(Seg{ .range = nextcut.cut, .weight = nextcut.curr_rules});
         }
 
@@ -635,8 +657,7 @@ const ParaNode = struct {
     }
 
     fn calAverageWeight(segs: *std.ArrayList(Seg)) f32 {
-        if (segs.items.len == 0)
-            return 0.0;
+        std.debug.assert(segs.items.len > 0);
         var sum:usize = 0;
         for (segs.items) |s| {
             sum += s.weight;
@@ -654,8 +675,8 @@ const ParaNode = struct {
         defer large_segs.deinit();
         var small_segs = std.ArrayList(Seg).init(allocator);
         defer small_segs.deinit();
-        var n_large:usize = 0;
-        var n_small:usize = 0;
+        var n_large:u32 = 0;
+        var n_small:u32 = 0;
 
         const size = di.size();
         const trunc_size = truncateSize(T, size);
@@ -976,7 +997,6 @@ const ParaNode = struct {
                     }
                 }
                 if (large_cuts) |l| {
-                    print("{} {}\n", .{l.items.len, offset});
                     for (0 .. l.items.len - 1) |i| {
                         cuts.u32x4.cuts[i + offset] = l.items[i+1].range.lo;
                     }
