@@ -33,6 +33,20 @@ const Range = struct {
         }
         return true;
     }
+
+    fn cover(self: *const Range, other: *const Range) bool {
+        if (@min(self.lo, other.lo) == self.lo and
+            @max(self.hi, other.hi) == self.hi) {
+            return true;
+        }
+        return false;
+    }
+
+    fn intersect(self: *const Range, other: *const Range) Range {
+        const lo = @max(self.lo, other.lo);
+        const hi = @min(self.hi, other.hi);
+        return Range{ .lo = lo, .hi = hi };
+    }
 };
 
 const Prefix = struct {
@@ -46,6 +60,21 @@ fn RuleType(N: comptime_int) type {
     return struct {
         ranges : [N]Range,
         pri : u32,
+        const Self = @This();
+
+        fn cover(self: *const Self, other: *const Self, di: []const DimInfo) bool {
+            for (0 .. N) |idx| {
+                const r = &self.ranges[idx];
+                const o = &other.ranges[idx];
+                const scope = &di[idx].r;
+
+                const inter = r.intersect(scope);
+                if (!inter.cover(o)) {
+                    return false;
+                }
+            }
+            return true;
+        }
     };
 }
 
@@ -124,8 +153,9 @@ test {
 }
 
 fn mapInto(r: *const Range, t: *const Range) Range {
-    const lo = @max(r.lo, t.lo);
-    const hi = @min(r.hi, t.hi);
+    const range = r.intersect(t);
+    const lo = range.lo;
+    const hi = range.hi;
 
     return Range{ .lo = lo - t.lo,
                   .hi = hi - t.lo };
@@ -788,6 +818,7 @@ const ParaNode = struct {
         }
     }
 
+    const binRules = 8;
     fn choose(self: *ParaNode, dim_segs: *[Dim]std.ArrayList(Seg), dim_info: []const DimInfo) Error!DimCut {
         var i:u8 = 0;
         var dc: ?DimCut = null;
@@ -799,7 +830,12 @@ const ParaNode = struct {
             getUniq(Seg).uniq(&dim_segs[i], false);
             //dumpSegs(&dim_segs[i], "orignal");
             //print("dim {} {any}\n", .{i, dim_info});
-            const cut_infos = try vectorizedCut(&dim_segs[i], &dim_info[i]);
+            var cut_infos = [_]CutInfo{.{}} ** cut_kinds;
+
+            //skip the dim which has only 1 seg but with more than binRules.
+            if (dim_segs[i].items.len != 1) {
+                cut_infos = try vectorizedCut(&dim_segs[i], &dim_info[i]);
+            }
             pickCut(&dc, &cut_infos, i);
         }
         //print("pick {} {} {d:.2}\n", .{dc.?.dim, dc.?.cut, dc.?.eff});
@@ -821,10 +857,44 @@ const ParaNode = struct {
         }
     }
 
-    const binRules = 8;
+    fn removeRedund(rules: *std.ArrayList(*Rule), dim_info:[]const DimInfo) void {
+        var idx:usize = rules.items.len - 1;
+
+        while (idx > 0) : (idx -= 1) {
+            var cover = false;
+            const rule = rules.items[idx];
+            for (0 .. idx) |cover_idx| {
+                const cover_rule = rules.items[cover_idx];
+                if (cover_rule.cover(rule, dim_info)) {
+                    cover = true;
+                    break;
+                }
+            }
+            if (cover) {
+                 _ = rules.orderedRemove(idx);
+            }
+        }
+    }
+
+    test {
+        const dim_info = &([_]DimInfo{ .{ .r = .{ .lo = 0, .hi = std.math.maxInt(u32)}}} ** Dim);
+        var rules = std.ArrayList(*Rule).init(allocator);
+        defer rules.deinit();
+        var  rules_alloc = [_]Rule{.{.ranges = [_]Range{ .{.lo = 0, .hi = std.math.maxInt(u32)} } ** Dim, .pri = 0},
+                                   .{.ranges = [_]Range{ .{.lo = 0, .hi = std.math.maxInt(u32)} } ** Dim, .pri = 1}};
+        try rules.append(&rules_alloc[0]);
+        try rules.append(&rules_alloc[1]);
+        removeRedund(&rules, dim_info);
+        try expect(rules.items.len == 1);
+    }
+
     fn build(self: *ParaNode, dim_info:[]const DimInfo) Error!void {
         if (self.rules.items.len < binRules) {
             return;
+        }
+
+        if (self.rules.items.len < 2 * binRules) {
+            removeRedund(&self.rules, dim_info);
         }
 
         var dim_segs : [Dim]std.ArrayList(Seg) = undefined;
@@ -1000,7 +1070,6 @@ const ParaNode = struct {
             }
         }
 
-        //self.dumpChildRules(true);
 
         var newcube = [_]DimInfo{undefined} ** Dim;
         @memcpy(&newcube, cube);
@@ -1019,6 +1088,8 @@ const ParaNode = struct {
             }
         }
 
+        //self.dump(false);
+        //self.dumpChildRules(false);
         defer dc.clear();
         defer self.rules.clearAndFree();
     }
@@ -1138,7 +1209,7 @@ pub fn main() !void {
     }
 
     var t = try paraCut(&rule_list);
-    //print("{}\n", .{t.countLeaves()});
+    print("{}\n", .{t.countLeaves()});
     t.deinit();
 }
 
