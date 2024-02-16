@@ -407,15 +407,15 @@ const NextCut = struct {
 
 const nLargeCuts = 1;
 const ParaFlag = packed struct(u32) {
-    large_cut : u1,
+    large_range : u1,
     trunc_flag: u1,
     large_mask: u1,
     unused: u13,
     small_mask: u16,
 
     fn dump(self: *ParaFlag) void {
-        print("Flag: large_cut {} trunc_flag: {} large_mask:0x{x:1} small_mask: 0x{x:02}\n",
-            .{self.large_cut, self.trunc_flag, self.large_mask, self.small_mask});
+        print("Flag: large_range {} trunc_flag: {} large_mask:0x{x:1} small_mask: 0x{x:02}\n",
+            .{self.large_range, self.trunc_flag, self.large_mask, self.small_mask});
 
     }
 
@@ -430,6 +430,9 @@ const TreeStat = struct {
     leaves: usize = 0,
     max_depth: usize = 0,
     depth: usize = 0,
+    avg_depth: f32 = 0.0,
+    sum: usize = 0,
+    max_nodes: usize = 0,
 };
 
 const ParaNode = struct {
@@ -638,8 +641,6 @@ const ParaNode = struct {
     }
 
     fn searchCuts(segs: *std.ArrayList(Seg), n_cuts: u8, n_rules: u32) Error!std.ArrayList(Seg) {
-        getUniq(Seg).uniq(segs, true);
-        //dumpSegs(segs, "uniq");
         const non = try genNonOverlappedSegs(segs);
         defer non.deinit();
         //dumpSegs(&non, "non");
@@ -698,6 +699,9 @@ const ParaNode = struct {
                 n_small += seg.weight;
             }
         }
+
+        getUniq(Seg).uniq(&large_segs, true);
+        getUniq(Seg).uniq(&small_segs, true);
 
         var eff:f32 = 0;
         var large: ?std.ArrayList(Seg) = null;
@@ -1048,7 +1052,7 @@ const ParaNode = struct {
         self.dim = dc.dim;
         self.flags = ParaFlag{.small_mask = if (small_len != 0) (@as(u16, 1) << @truncate(small_len - 1)) - 1 else 0,
                               .large_mask = if (large_len > 1) 1 else 0,
-                              .large_cut = if (large_len != 0) 1 else 0,
+                              .large_range = if (large_len != 0) 1 else 0,
                               .trunc_flag = truncFlag(dc, di), .unused = 0};
         self.offset = di.r.lo;
         self.initChildNode();
@@ -1177,6 +1181,7 @@ const ParaNode = struct {
     fn stat(self: *const ParaNode, s: *TreeStat) void {
         if (self.dim == LeafNode) {
             s.leaves += 1;
+            s.sum += s.max_depth;
         } else {
             s.nodes += 1;
             s.max_depth += 1;
@@ -1187,12 +1192,27 @@ const ParaNode = struct {
             s.max_depth -= 1;
         }
     }
+
+    fn path(self: *const ParaNode) usize {
+        if (self.dim == LeafNode) {
+            return 0;
+        }
+
+        var max:usize = 0;
+        for (self.next) |*n| {
+            max = @max(n.path(), max);
+        }
+
+        if (self.flags.large_range == 1) {
+            return max + 2;
+        } else {
+            return max + 1;
+        }
+    }
 };
 
 const ParaTree = struct {
     root: ParaNode,
-
-
 
     fn build(self: *ParaTree, dim_info:[]const DimInfo) !void {
         try self.root.build(dim_info);
@@ -1204,6 +1224,8 @@ const ParaTree = struct {
 
     fn stat(self: *ParaTree, s: *TreeStat) void {
         self.root.stat(s);
+        s.avg_depth = @as(f32, @floatFromInt(s.sum)) / @as(f32, @floatFromInt(s.leaves));
+        s.max_nodes = self.root.path();
     }
 };
 
