@@ -42,6 +42,10 @@ const Range = struct {
         return false;
     }
 
+    fn coverValue(self: *const Range, v: u32) bool {
+        return v >= self.lo and v <= self.hi;
+    }
+
     fn intersect(self: *const Range, other: *const Range) Range {
         const lo = @max(self.lo, other.lo);
         const hi = @min(self.hi, other.hi);
@@ -52,6 +56,10 @@ const Range = struct {
 const Prefix = struct {
     prefix : u32,
     len : u6,
+};
+
+const SearchKey = struct {
+    keys: [Dim]u32,
 };
 
 const Dim = 5;
@@ -72,6 +80,14 @@ fn RuleType(N: comptime_int) type {
                 if (!inter.cover(o)) {
                     return false;
                 }
+            }
+            return true;
+        }
+
+        fn match(self: *const Self, key: *const SearchKey) bool {
+            for (0 .. Dim) |i| {
+                if (!self.ranges[i].coverValue(key.keys[i]))
+                    return false;
             }
             return true;
         }
@@ -940,7 +956,7 @@ const ParaNode = struct {
     }
 
     fn build(self: *ParaNode, dim_info:[]const DimInfo) Error!void {
-        if (self.rules.items.len < binRules) {
+        if (self.rules.items.len <= binRules) {
             return;
         }
 
@@ -1228,6 +1244,35 @@ const ParaTree = struct {
         s.max_nodes = self.root.path();
     }
 };
+
+const LinearSearch = struct {
+    ruleset: *const std.ArrayList(Rule),
+
+    fn init(self: *LinearSearch, ruleset: *const std.ArrayList(Rule)) void {
+        self.ruleset = ruleset;
+    }
+
+    fn search(self: *const LinearSearch, key: *const SearchKey) ?*const Rule {
+        for (self.ruleset.items) |*r| {
+            if (r.match(key))
+                return r;
+        }
+        return null;
+    }
+};
+
+test {
+    var ruleset = std.ArrayList(Rule).init(allocator);
+    defer ruleset.deinit();
+    try ruleset.append(.{ .ranges = [_]Range{ .{ .lo = 2, .hi = std.math.maxInt(u32) }} ** Dim,
+                          .pri = 1});
+    try ruleset.append(.{ .ranges = [_]Range{ .{ .lo = 0, .hi = std.math.maxInt(u32) / 2 }} ** Dim,
+                          .pri = 2});
+    const lr = LinearSearch{ .ruleset = &ruleset };
+    const k = SearchKey{.keys = [_]u32{1} ** Dim};
+    try expect(lr.search(&k) == &ruleset.items[1]);
+
+}
 
 const DimInfo = struct {
     r : Range,
