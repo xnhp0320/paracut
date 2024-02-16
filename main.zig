@@ -8,6 +8,9 @@ const Error = std.mem.Allocator.Error;
 var gpa = std.heap.GeneralPurposeAllocator(.{.safety = true}){};
 const allocator = gpa.allocator();
 
+const RndGen = std.rand.DefaultPrng;
+var rnd = RndGen.init(0);
+
 const Range = struct {
     lo : u32,
     hi : u32,
@@ -51,6 +54,12 @@ const Range = struct {
         const hi = @min(self.hi, other.hi);
         return Range{ .lo = lo, .hi = hi };
     }
+
+    fn random(self: *const Range) u32 {
+        const v = rnd.random().int(u32);
+        const w = @as(u64, @intCast(self.hi - self.lo)) + 1;
+        return  @intCast(v % w + self.lo);
+    }
 };
 
 const Prefix = struct {
@@ -59,7 +68,13 @@ const Prefix = struct {
 };
 
 const SearchKey = struct {
-    keys: [Dim]u32,
+    keys: [Dim]u32 = undefined,
+
+    fn sampleRule(self: *SearchKey, rule: *const Rule) void {
+        for (0 .. Dim) |i| {
+            self.keys[i] = rule.ranges[i].random();
+        }
+    }
 };
 
 const Dim = 5;
@@ -239,7 +254,7 @@ const ParaCuts = union(CutTag) {
         cuts: @Vector(4, u32),
     },
 
-    fn dump(self:*ParaCuts) void {
+    fn dump(self:*const ParaCuts) void {
         print("{}\n", .{self.*});
     }
 };
@@ -423,15 +438,15 @@ const NextCut = struct {
 
 const nLargeCuts = 1;
 const ParaFlag = packed struct(u32) {
-    large_range : u1,
+    extra_range : u1,
     trunc_flag: u1,
-    large_mask: u1,
+    extra_mask: u1,
     unused: u13,
-    small_mask: u16,
+    cut_mask: u16,
 
-    fn dump(self: *ParaFlag) void {
-        print("Flag: large_range {} trunc_flag: {} large_mask:0x{x:1} small_mask: 0x{x:02}\n",
-            .{self.large_range, self.trunc_flag, self.large_mask, self.small_mask});
+    fn dump(self: *const ParaFlag) void {
+        print("Flag: extra_range {} trunc_flag: {} extra_mask:0x{x:1} cut_mask: 0x{x:02}\n",
+            .{self.extra_range, self.trunc_flag, self.extra_mask, self.cut_mask});
 
     }
 
@@ -975,6 +990,10 @@ const ParaNode = struct {
             }
         }
 
+        //for (dim_info) |d| {
+        //    print("{} ", .{d.r});
+        //}
+        //print("\n", .{});
         var dc = try choose(self, &dim_segs, dim_info);
         if (dc.eff != std.math.floatMax(f32)) {
             try self.pushRules(&dc, dim_info);
@@ -1060,15 +1079,19 @@ const ParaNode = struct {
     }
 
     fn fromDimCut(self: *ParaNode, dc: *const DimCut, di: *const DimInfo) !void {
+        //could be only large/small cuts.
         const large_len = if (dc.large_cuts) |l| l.items.len else 0;
         const small_len = if (dc.small_cuts) |s| s.items.len else 0;
+        const cut_len = @max(large_len, small_len);
+        const extra_len = @min(large_len, small_len);
+        std.debug.assert(cut_len > 0);
         //print("allocate {} nodes, large {} small {}\n", .{ large_len + small_len, large_len, small_len });
 
         self.next = try allocator.alloc(ParaNode, large_len + small_len);
         self.dim = dc.dim;
-        self.flags = ParaFlag{.small_mask = if (small_len != 0) (@as(u16, 1) << @truncate(small_len - 1)) - 1 else 0,
-                              .large_mask = if (large_len > 1) 1 else 0,
-                              .large_range = if (large_len != 0) 1 else 0,
+        self.flags = ParaFlag{.cut_mask = (@as(u16, 1) << @truncate(cut_len - 1)) - 1,
+                              .extra_mask = if (extra_len > 1) 1 else 0,
+                              .extra_range = if (extra_len != 0) 1 else 0,
                               .trunc_flag = truncFlag(dc, di), .unused = 0};
         self.offset = di.r.lo;
         self.initChildNode();
@@ -1117,10 +1140,6 @@ const ParaNode = struct {
 
         const large_offset = if (dc.small_cuts) |s| s.items.len else 0;
 
-        //NOTE: if nLargeCuts == 0, we do not need to seprate ranges into
-        //large/small size, just push it down to child nodes.
-        std.debug.assert(nLargeCuts > 0);
-
         const trunc_size = truncFromTag(di.size(), dc.cut);
         for (self.rules.items) |rule| {
             const range = &rule.ranges[dc.dim];
@@ -1158,23 +1177,26 @@ const ParaNode = struct {
                 try self.next[large_offset + idx].build(&newcube);
             }
         }
-
         //self.dump(false);
         //self.dumpChildRules(false);
         defer self.rules.clearAndFree();
     }
 
-    fn dump(self: *ParaNode, verbose: bool) void {
+    fn dump(self: *const ParaNode, verbose: bool) void {
         if (self.dim == LeafNode) {
             print("LeafNode\n", .{});
             return;
         }
 
-        print("dim {}\n", .{self.dim});
+        print("dim {} {*}\n", .{self.dim, self});
         print("offset {}\n", .{self.offset});
         self.flags.dump();
         self.cuts.dump();
         print("next {}\n", .{self.next.len});
+        for (0 .. self.next.len) |i| {
+            print("{*} ", .{self.next.ptr + i});
+        }
+        print("\n", .{});
         print("rules {}\n", .{self.rules.items.len});
         if (verbose) {
             for (self.rules.items) |r| {
@@ -1211,19 +1233,105 @@ const ParaNode = struct {
 
     fn path(self: *const ParaNode) usize {
         if (self.dim == LeafNode) {
+            return 1;
+        }
+
+        var smallmax:usize = 0;
+        const large_offset = @popCount(self.flags.cut_mask) + 1;
+        for (0 .. large_offset) |i| {
+            smallmax = @max(self.next[i].path(), smallmax);
+        }
+
+        var largemax:usize = 0;
+        if (self.flags.extra_range == 1) {
+            const large_end = if (self.flags.extra_mask != 0) large_offset + 2 else large_offset + 1;
+            for (large_offset .. large_end) |i| {
+                largemax = @max(self.next[i].path(), largemax);
+            }
+        }
+        return smallmax + largemax;
+    }
+
+    const shift = [cut_kinds]u5{24, 16, 0};
+    fn getNext(self: *const ParaNode, key: *const SearchKey, cand: *[2]?*const ParaNode) u8 {
+        //step 1: extract the value;
+        var k = key.keys[self.dim];
+        if (k < self.offset) {
             return 0;
         }
+        //step 2: minus the offset
+        k -= self.offset;
+        //step 3: truncate
+        const tag = @as(CutTag, self.cuts);
+        k = if (self.flags.trunc_flag != 0) k >> shift[@intFromEnum(tag)] else k;
+        var bitmask:u16 = undefined;
 
-        var max:usize = 0;
-        for (self.next) |*n| {
-            max = @max(n.path(), max);
+        switch (self.cuts) {
+            .u8x16 => |c| {
+                const v:@Vector(16, u8) = @splat(@truncate(k));
+                const bits = @as(u16, @bitCast(v >= c.cuts));
+                bitmask = bits;
+            },
+            .u16x8 => |c| {
+                const v:@Vector(8, u16) = @splat(@truncate(k));
+                const bits = @as(u8, @bitCast(v >= c.cuts));
+                bitmask = @as(u16, @intCast(bits));
+            },
+            .u32x4 => |c| {
+                const v:@Vector(4, u32) = @splat(@truncate(k));
+                const bits = @as(u4, @bitCast(v >= c.cuts));
+                bitmask = @as(u16, @intCast(bits));
+            },
         }
 
-        if (self.flags.large_range == 1) {
-            return max + 2;
-        } else {
-            return max + 1;
+        const node_off = @popCount(bitmask & self.flags.cut_mask);
+        cand[0] = &self.next[node_off];
+
+        if (self.flags.extra_range != 0) {
+            var extra_off = @popCount(self.flags.cut_mask);
+
+            if (self.flags.extra_mask != 0) {
+                if ((bitmask & (@as(u16, 1) << @truncate(extra_off))) != 0) {
+                    extra_off += 1;
+                }
+            }
+            cand[1] = &self.next[extra_off + 1];
+            return 2;
         }
+        return 1;
+    }
+
+    test {
+        var node = ParaNode{};
+        node.dim = 1;
+        node.flags = ParaFlag{.extra_range = 1, .trunc_flag = 1, .extra_mask = 1, .cut_mask = 0x1f, .unused = 0};
+        node.cuts = ParaCuts{.u16x8 = .{ .cuts = [_]u16{16308, 16697, 16911, 37554, 53780, 16384, 0, 0 }}};
+        node.next = try allocator.alloc(ParaNode, 8);
+        defer allocator.free(node.next);
+
+        for (0 .. 8) |i| {
+            node.next[i] = ParaNode{};
+        }
+        const key = SearchKey{.keys = [_]u32{ 0} ++ [_]u32{16697 << 16} ++ [_]u32{0} ** 3};
+        const key2 = SearchKey{.keys = [_]u32{ 0} ++ [_]u32{16307 << 16} ++ [_]u32{0} ** 3};
+        var cand = [_]?*const ParaNode{null, null};
+        try expect(node.getNext(&key, &cand) == 2);
+        try expect(cand[0] == &node.next[2]);
+        try expect(cand[1] == &node.next[7]);
+
+        cand = [_]?*const ParaNode{null, null};
+        try expect(node.getNext(&key2, &cand) == 2);
+        try expect(cand[0] == &node.next[0]);
+        try expect(cand[1] == &node.next[6]);
+    }
+
+    fn search(self: *const ParaNode, key: *const SearchKey) ?*Rule {
+        for (self.rules.items) |r| {
+            if (r.match(key)) {
+                return r;
+            }
+        }
+        return null;
     }
 };
 
@@ -1243,15 +1351,53 @@ const ParaTree = struct {
         s.avg_depth = @as(f32, @floatFromInt(s.sum)) / @as(f32, @floatFromInt(s.leaves));
         s.max_nodes = self.root.path();
     }
+
+    const Fifo = struct {
+        s: u16 = 0,
+        e: u16 = 0,
+        buffer: [16]?*const ParaNode = [_]?*const ParaNode{null} ** 16,
+
+        fn push(self: *Fifo, p:*const ParaNode) void {
+            self.buffer[self.e] = p;
+            self.e +%= 1;
+        }
+
+        fn pop(self: *Fifo) ?*const ParaNode {
+            const p = self.buffer[self.s];
+            self.s +%= 1;
+            return p;
+        }
+    };
+
+    fn search(self: *const ParaTree, key: *const SearchKey) ?*const Rule {
+        var f = Fifo{};
+        f.push(&self.root);
+        var final:?*const Rule = null;
+
+        while(f.pop()) |n| {
+            if (n.dim == ParaNode.LeafNode) {
+                if (n.search(key)) |rule| {
+                    if (final == null) {
+                        final = rule;
+                    } else if (rule.pri < final.?.pri) {
+                        final = rule;
+                    }
+                }
+            } else {
+                var cand = [_]?*const ParaNode{null} ** 2;
+                const n_node = n.getNext(key, &cand);
+                for (0 .. n_node) |i| {
+                    f.push(cand[i].?);
+                }
+            }
+        }
+
+        return final;
+    }
 };
 
 const LinearSearch = struct {
     ruleset: *const std.ArrayList(Rule),
-
-    fn init(self: *LinearSearch, ruleset: *const std.ArrayList(Rule)) void {
-        self.ruleset = ruleset;
-    }
-
     fn search(self: *const LinearSearch, key: *const SearchKey) ?*const Rule {
         for (self.ruleset.items) |*r| {
             if (r.match(key))
@@ -1272,6 +1418,12 @@ test {
     const k = SearchKey{.keys = [_]u32{1} ** Dim};
     try expect(lr.search(&k) == &ruleset.items[1]);
 
+    var k1 = SearchKey{};
+    k1.sampleRule(&ruleset.items[0]);
+    for (0 .. Dim) |i| {
+        try expect(ruleset.items[0].ranges[i].coverValue(k1.keys[i]));
+    }
+
 }
 
 const DimInfo = struct {
@@ -1283,10 +1435,16 @@ const DimInfo = struct {
 };
 
 test {
-    const v:u32 = 0;
-    try expect(@popCount(v) == 0);
+    const x1:u32 = 0;
+    try expect(@popCount(x1) == 0);
     const x:u16 = 0x7;
     try expect(@popCount(x) == 3);
+
+    const v:@Vector(8, u16) = [_]u16{1} ** 4 ++ [_]u16{2} ** 4;
+    const v1:@Vector(8, u16) = @splat(1);
+    const bits = @as(u8, @bitCast(v1 >= v));
+    const up = @as(u32, @intCast(bits));
+    try expect(up == 0b00001111);
 }
 
 fn paraCut(rule_list : *std.ArrayList(Rule)) !ParaTree {
@@ -1342,6 +1500,17 @@ pub fn main() !void {
     var stat = TreeStat{};
     t.stat(&stat);
     print("{}\n", .{stat});
+
+    const key = SearchKey{.keys = [_]u32{ 0} ++ [_]u32{16697 << 16} ++ [_]u32{0} ** 3};
+    var lr = LinearSearch{.ruleset = &rule_list};
+    if(lr.search(&key)) |r| {
+        print("{}\n", .{r.*});
+    }
+
+    if (t.search(&key)) |r| {
+        print("{}\n", .{r.*});
+    }
+
     //print("node size {}\n", .{@sizeOf(ParaNode)});
     //print("cut size {}\n", .{@sizeOf(ParaCuts)});
     t.deinit();
