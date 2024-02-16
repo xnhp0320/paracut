@@ -348,6 +348,7 @@ const NextCut = struct {
             if (top.v < self.cut.lo) {
                 const w = self.h.remove();
                 self.curr_rules -= w.w;
+                self.pass_rules += w.w;
             } else {
                 break;
             }
@@ -357,7 +358,6 @@ const NextCut = struct {
             const seg = &segs.items[self.seg_idx];
             if (seg.range.lo <= self.cut.hi) {
                 self.curr_rules += seg.weight;
-                self.pass_rules += seg.weight;
                 try self.h.add(W{.v = seg.range.hi, .w = seg.weight});
             } else {
                 break;
@@ -423,6 +423,13 @@ const ParaFlag = packed struct(u32) {
         // to make sure large_mask is u1.
         std.debug.assert(nLargeCuts == 1);
     }
+};
+
+const TreeStat = struct {
+    nodes: usize = 0,
+    leaves: usize = 0,
+    max_depth: usize = 0,
+    depth: usize = 0,
 };
 
 const ParaNode = struct {
@@ -1132,7 +1139,7 @@ const ParaNode = struct {
             }
         }
 
-        self.dump(false);
+        //self.dump(false);
         //self.dumpChildRules(false);
         defer self.rules.clearAndFree();
     }
@@ -1167,19 +1174,25 @@ const ParaNode = struct {
         allocator.free(self.next);
     }
 
-    fn countLeaves(self: *const ParaNode, val: *usize) void {
+    fn stat(self: *const ParaNode, s: *TreeStat) void {
         if (self.dim == LeafNode) {
-            val.* += 1;
+            s.leaves += 1;
         } else {
+            s.nodes += 1;
+            s.max_depth += 1;
+            s.depth = @max(s.max_depth, s.depth);
             for (self.next) |*n| {
-                n.countLeaves(val);
+                n.stat(s);
             }
+            s.max_depth -= 1;
         }
     }
 };
 
 const ParaTree = struct {
     root: ParaNode,
+
+
 
     fn build(self: *ParaTree, dim_info:[]const DimInfo) !void {
         try self.root.build(dim_info);
@@ -1189,10 +1202,8 @@ const ParaTree = struct {
         self.root.deinit();
     }
 
-    fn countLeaves(self: *ParaTree) usize {
-        var leaves:usize = 0;
-        self.root.countLeaves(&leaves);
-        return leaves;
+    fn stat(self: *ParaTree, s: *TreeStat) void {
+        self.root.stat(s);
     }
 };
 
@@ -1203,6 +1214,13 @@ const DimInfo = struct {
         return self.r.hi - self.r.lo +| 1;
     }
 };
+
+test {
+    const v:u32 = 0;
+    try expect(@popCount(v) == 0);
+    const x:u16 = 0x7;
+    try expect(@popCount(x) == 3);
+}
 
 fn paraCut(rule_list : *std.ArrayList(Rule)) !ParaTree {
     var tree: ParaTree = .{ .root = .{}};
@@ -1254,7 +1272,11 @@ pub fn main() !void {
     }
 
     var t = try paraCut(&rule_list);
-    print("{}\n", .{t.countLeaves()});
+    var stat = TreeStat{};
+    t.stat(&stat);
+    print("{}\n", .{stat});
+    //print("node size {}\n", .{@sizeOf(ParaNode)});
+    //print("cut size {}\n", .{@sizeOf(ParaCuts)});
     t.deinit();
 }
 
