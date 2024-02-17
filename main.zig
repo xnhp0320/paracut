@@ -915,7 +915,7 @@ const ParaNode = struct {
             var cut_infos = [_]CutInfo{.{}} ** cut_kinds;
 
             //skip the dim which has only 1 seg but with more than binRules.
-            if (dim_segs[i].items.len != 1) {
+            if (dim_segs[i].items.len > 1) {
                 cut_infos = try vectorizedCut(&dim_segs[i], &dim_info[i]);
             }
             pickCut(&dc, &cut_infos, i);
@@ -1249,7 +1249,7 @@ const ParaNode = struct {
                 largemax = @max(self.next[i].path(), largemax);
             }
         }
-        return smallmax + largemax;
+        return 1 + smallmax + largemax;
     }
 
     const shift = [cut_kinds]u5{24, 16, 0};
@@ -1373,6 +1373,22 @@ const ParaTree = struct {
         }
     };
 
+    //Search only middle nodes achieve 20Mpps, still slow
+    //fn searchHalf(self: *const ParaTree, key: *const SearchKey) void {
+    //    var f = Fifo{};
+    //    f.push(&self.root);
+
+    //    while(f.pop()) |n| {
+    //        if (n.dim != ParaNode.LeafNode) {
+    //            var cand = [_]?*const ParaNode{null} ** 2;
+    //            const n_node = n.getNext(key, &cand);
+    //            for (0 .. n_node) |i| {
+    //                f.push(cand[i].?);
+    //            }
+    //        }
+    //    }
+    //}
+
     fn search(self: *const ParaTree, key: *const SearchKey) ?*const Rule {
         var f = Fifo{};
         f.push(&self.root);
@@ -1469,7 +1485,6 @@ fn paraCut(rule_list : *std.ArrayList(Rule)) !ParaTree {
 
 fn prepareKeys(num: usize, ruleset: *const std.ArrayList(Rule)) []SearchKey {
     var keys = allocator.alloc(SearchKey, num * ruleset.items.len) catch unreachable;
-    print("allocating {} keys for validation\n", .{ num * ruleset.items.len});
     for (0 .. , ruleset.items) |idx, *rule| {
         for (0 .. num) |i| {
             keys[idx * num + i].sampleRule(rule);
@@ -1481,6 +1496,7 @@ fn prepareKeys(num: usize, ruleset: *const std.ArrayList(Rule)) []SearchKey {
 fn validation(t: *const ParaTree, num: usize, ruleset: *const std.ArrayList(Rule)) void {
     const keys = prepareKeys(num, ruleset);
     defer allocator.free(keys);
+    print("allocating {} keys for validation\n", .{ num * ruleset.items.len});
     const lr = LinearSearch{.ruleset = ruleset};
 
     for (keys) |*key| {
