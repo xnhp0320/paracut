@@ -1510,7 +1510,7 @@ fn bench(t: *const ParaTree, num: usize, ruleset: *const std.ArrayList(Rule)) vo
         std.mem.doNotOptimizeAway(rule);
     }
     const elapsed = timer.read();
-    print("{}ns passed for {} keys, around {d:2} Mpps\n",
+    print("{}ns passed for {} keys, around {d:.2} Mpps\n",
         .{ elapsed, keys.len, @as(f32, @floatFromInt(keys.len)) * 1e3 / @as(f32, @floatFromInt(elapsed)) });
 }
 
@@ -1551,7 +1551,7 @@ pub fn main() !void {
     var stat = TreeStat{};
     t.stat(&stat);
     print("{}\n", .{stat});
-    validation(&t, 100, &rule_list);
+    validation(&t, 1000, &rule_list);
     bench(&t, 100, &rule_list);
     t.deinit();
 }
