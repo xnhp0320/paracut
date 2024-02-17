@@ -1353,17 +1353,21 @@ const ParaTree = struct {
     }
 
     const Fifo = struct {
-        s: u16 = 0,
-        e: u16 = 0,
-        buffer: [16]?*const ParaNode = [_]?*const ParaNode{null} ** 16,
+        const size = 16;
+        s: u32 = 0,
+        e: u32 = 0,
+        buffer: [size]?*const ParaNode = undefined,
 
         fn push(self: *Fifo, p:*const ParaNode) void {
-            self.buffer[self.e] = p;
+            self.buffer[self.e & (size - 1)] = p;
             self.e +%= 1;
         }
 
         fn pop(self: *Fifo) ?*const ParaNode {
-            const p = self.buffer[self.s];
+            if (self.s == self.e) {
+                return null;
+            }
+            const p = self.buffer[self.s & (size - 1)];
             self.s +%= 1;
             return p;
         }
@@ -1463,6 +1467,33 @@ fn paraCut(rule_list : *std.ArrayList(Rule)) !ParaTree {
     return tree;
 }
 
+fn validation(t: *const ParaTree, num: usize, ruleset: *const std.ArrayList(Rule)) void {
+    var keys = allocator.alloc(SearchKey, num * ruleset.items.len) catch unreachable;
+    print("allocating {} keys for validation", .{ num * ruleset.items.len});
+    defer allocator.free(keys);
+    for (0 .. , ruleset.items) |idx, *rule| {
+        for (0 .. num) |i| {
+            keys[idx * num + i].sampleRule(rule);
+        }
+    }
+    const lr = LinearSearch{.ruleset = ruleset};
+
+    for (0 .. num * ruleset.items.len) |i| {
+        const key = &keys[i];
+        const rule1 = lr.search(key);
+        const rule2 = t.search(key);
+        if (rule1 != rule2) {
+            print("linear search is {*} our search is {*}\n", .{rule1, rule2});
+            if (rule1) |r| {
+                print("rule1 {}\n", .{r});
+            }
+            if (rule2) |r| {
+                print("rule2 {}\n", .{r});
+            }
+        }
+    }
+}
+
 pub fn main() !void {
     defer _ = gpa.deinit();
 
@@ -1500,19 +1531,7 @@ pub fn main() !void {
     var stat = TreeStat{};
     t.stat(&stat);
     print("{}\n", .{stat});
-
-    const key = SearchKey{.keys = [_]u32{ 0} ++ [_]u32{16697 << 16} ++ [_]u32{0} ** 3};
-    var lr = LinearSearch{.ruleset = &rule_list};
-    if(lr.search(&key)) |r| {
-        print("{}\n", .{r.*});
-    }
-
-    if (t.search(&key)) |r| {
-        print("{}\n", .{r.*});
-    }
-
-    //print("node size {}\n", .{@sizeOf(ParaNode)});
-    //print("cut size {}\n", .{@sizeOf(ParaCuts)});
+    validation(&t, 100, &rule_list);
     t.deinit();
 }
 
