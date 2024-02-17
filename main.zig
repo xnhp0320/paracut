@@ -1467,19 +1467,23 @@ fn paraCut(rule_list : *std.ArrayList(Rule)) !ParaTree {
     return tree;
 }
 
-fn validation(t: *const ParaTree, num: usize, ruleset: *const std.ArrayList(Rule)) void {
+fn prepareKeys(num: usize, ruleset: *const std.ArrayList(Rule)) []SearchKey {
     var keys = allocator.alloc(SearchKey, num * ruleset.items.len) catch unreachable;
-    print("allocating {} keys for validation", .{ num * ruleset.items.len});
-    defer allocator.free(keys);
+    print("allocating {} keys for validation\n", .{ num * ruleset.items.len});
     for (0 .. , ruleset.items) |idx, *rule| {
         for (0 .. num) |i| {
             keys[idx * num + i].sampleRule(rule);
         }
     }
+    return keys;
+}
+
+fn validation(t: *const ParaTree, num: usize, ruleset: *const std.ArrayList(Rule)) void {
+    const keys = prepareKeys(num, ruleset);
+    defer allocator.free(keys);
     const lr = LinearSearch{.ruleset = ruleset};
 
-    for (0 .. num * ruleset.items.len) |i| {
-        const key = &keys[i];
+    for (keys) |*key| {
         const rule1 = lr.search(key);
         const rule2 = t.search(key);
         if (rule1 != rule2) {
@@ -1492,6 +1496,22 @@ fn validation(t: *const ParaTree, num: usize, ruleset: *const std.ArrayList(Rule
             }
         }
     }
+}
+
+const clock = std.time.Timer;
+
+fn bench(t: *const ParaTree, num: usize, ruleset: *const std.ArrayList(Rule)) void {
+    var timer  = clock.start() catch unreachable;
+    const keys = prepareKeys(num, ruleset);
+    defer allocator.free(keys);
+    timer.reset();
+    for (keys) |*key| {
+        const rule = t.search(key);
+        std.mem.doNotOptimizeAway(rule);
+    }
+    const elapsed = timer.read();
+    print("{}ns passed for {} keys, around {d:2} Mpps\n",
+        .{ elapsed, keys.len, @as(f32, @floatFromInt(keys.len)) * 1e3 / @as(f32, @floatFromInt(elapsed)) });
 }
 
 pub fn main() !void {
@@ -1532,6 +1552,7 @@ pub fn main() !void {
     t.stat(&stat);
     print("{}\n", .{stat});
     validation(&t, 100, &rule_list);
+    bench(&t, 100, &rule_list);
     t.deinit();
 }
 
